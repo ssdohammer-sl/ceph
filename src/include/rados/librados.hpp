@@ -767,6 +767,7 @@ inline namespace v14_2_0 {
      * updates.
      */
     void tier_evict();
+    void is_hot(bool *isdirty, int *prval);
   };
 
   /* IoCtx : This is a context in which we can perform I/O.

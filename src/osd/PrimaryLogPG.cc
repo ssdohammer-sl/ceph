@@ -15186,12 +15186,14 @@ bool PrimaryLogPG::agent_choose_mode(bool restart, OpRequestRef op)
 
   // also reduce the num_dirty by num_objects_omap
   int64_t num_dirty = info.stats.stats.sum.num_objects_dirty;
+#if 0
   if (!base_pool->supports_omap()) {
     if (num_dirty > info.stats.stats.sum.num_objects_omap)
       num_dirty -= info.stats.stats.sum.num_objects_omap;
     else
       num_dirty = 0;
   }
+#endif
 
   dout(10) << __func__
 	   << " flush_mode: "
@@ -15349,6 +15351,9 @@ bool PrimaryLogPG::agent_choose_mode(bool restart, OpRequestRef op)
       });
     agent_state->evict_mode = evict_mode;
   }
+
+  agent_state->evict_mode = TierAgentState::EVICT_MODE_SOME;
+
   uint64_t old_effort = agent_state->evict_effort;
   if (evict_effort != agent_state->evict_effort) {
     dout(5) << __func__ << " evict_effort "
@@ -15368,6 +15373,7 @@ bool PrimaryLogPG::agent_choose_mode(bool restart, OpRequestRef op)
     }
   } else {
     if (restart || old_idle) {
+      dout(0) << " enable cache agent: " << info.pgid << dendl;
       osd->agent_enable_pg(this, agent_state->evict_effort);
     } else if (old_effort != agent_state->evict_effort) {
       osd->agent_adjust_pg(this, old_effort, agent_state->evict_effort);
