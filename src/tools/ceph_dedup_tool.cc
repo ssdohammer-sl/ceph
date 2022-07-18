@@ -1793,9 +1793,20 @@ int make_dedup_object(const std::map < std::string, std::string > &opts,
      * the object a manifest object, the tier_flush() will remove
      * it and replace it with the real contents.
      */
+    
     ret = make_manifest_object_and_flush(object_name, io_ctx, chunk_io_ctx);
     if (ret < 0) {
       cerr << __func__ << " failed\n";
+      goto out;
+    }
+    
+
+    // tier-flush to perform deduplication
+    ObjectReadOperation flush_op;
+    flush_op.tier_flush();
+    ret = io_ctx.operate(object_name, &flush_op, NULL);
+    if (ret < 0) {
+      cerr << " tier_flush fail : " << cpp_strerror(ret) << std::endl;
       goto out;
     }
 
