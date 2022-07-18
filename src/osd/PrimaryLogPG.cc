@@ -7460,7 +7460,11 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  break;
 	}
 
-	if (oi.is_dirty()) {
+	if (oi.is_dirty() || !obs.oi.has_manifest()) {
+          if (!obs.oi.has_manifest()) {
+            ctx->obc->obs.oi.set_flag(object_info_t::FLAG_MANIFEST);
+            ctx->obc->obs.oi.manifest.type = object_manifest_t::TYPE_CHUNKED;
+          }
 	  result = start_flush(ctx->op, ctx->obc, true, NULL, std::nullopt);
 	  if (result == -EINPROGRESS)
 	    result = -EAGAIN;
