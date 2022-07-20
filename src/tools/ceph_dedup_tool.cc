@@ -260,11 +260,13 @@ class ChunkScrub: public CrawlerThread
 {
   IoCtx chunk_io_ctx;
   int damaged_objects = 0;
+  bool fixed = false;
 
 public:
   ChunkScrub(IoCtx& io_ctx, int n, int m, ObjectCursor begin, ObjectCursor end, 
-	     IoCtx& chunk_io_ctx, int32_t report_period, uint64_t num_objects):
-    CrawlerThread(io_ctx, n, m, begin, end, report_period, num_objects), chunk_io_ctx(chunk_io_ctx)
+	     IoCtx& chunk_io_ctx, int32_t report_period, uint64_t num_objects, bool fixed):
+    CrawlerThread(io_ctx, n, m, begin, end, report_period, num_objects), chunk_io_ctx(chunk_io_ctx),
+    fixed(fixed)
     { }
   void* entry() {
     chunk_scrub_common();
@@ -458,7 +460,7 @@ void ChunkScrub::chunk_scrub_common()
 	return;
       }
       auto oid = i.oid;
-      cout << oid << std::endl;
+//      cout << "chunk oid : " << oid << std::endl;
       chunk_refs_t refs;
       {
 	bufferlist t;
@@ -484,6 +486,74 @@ void ChunkScrub::chunk_scrub_common()
       uint64_t pool_missing = 0;
       uint64_t object_missing = 0;
       uint64_t does_not_ref = 0;
+
+      // Test code for Fixed scrub
+      if (fixed) {
+//        cout << " **** Start Fixed Scrub ****" << std::endl;
+        bool ref_find = false;
+        int num_base_pool_objs = 0;
+        for (auto& pp : byo->by_object) {
+          IoCtx target_io_ctx;
+          ret = rados.ioctx_create2(pp.pool, target_io_ctx);
+          if (ret < 0) {
+            cerr << oid << " ref " << pp
+                << ": referencing pool does not exist" << std::endl;
+            continue;
+          }
+ 
+          ObjectCursor src_shard_start;
+          ObjectCursor src_shard_end;
+          ObjectCursor src_begin;
+          ObjectCursor src_end;
+          src_begin = target_io_ctx.object_list_begin();
+          src_end = target_io_ctx.object_list_end();
+
+          target_io_ctx.object_list_slice(
+            src_begin,
+            src_end,
+            1,
+            1,
+            &src_shard_start,
+            &src_shard_end);
+          ObjectCursor c(src_shard_start);
+          while (c < src_shard_end) {
+            std::vector<ObjectItem> result;
+            int r = target_io_ctx.object_list(c, src_shard_end, 100, {}, &result, &c);
+            if (r < 0) {
+              cerr << "error object_list: " << cpp_strerror(r) << std::endl;
+              return;
+            }
+
+            num_base_pool_objs += result.size();
+//            cout << "  slice size : " << result.size() << std::endl;
+
+            for (const auto &i : result) {
+//              cout << "    pp.oid.name (ref): " << pp.oid.name << std::endl;
+//              cout << "    i.oid (base-pool) : " << i.oid << std::endl;
+              // compare between src object of chunk object and base pol object
+              if (i.oid == pp.oid.name) { 
+                ref_find = true;
+//                cout << "      FIND!" << std::endl;
+                break;
+              }
+//              cout << "      NOT FOUND" << std::endl;
+            }
+            if (ref_find) {
+              ref_find = false;
+              break;
+            }
+          }
+        }
+
+        if (!ref_find) {
+//          cout << "  " << oid << " is damaged" << std::endl;
+          ++object_missing;
+        }
+        
+        // WILL BE DELETED
+//        cout << " total base pool object  = " << num_base_pool_objs << std::endl;
+      } else {
+
       for (auto& pp : byo->by_object) {
 	IoCtx target_io_ctx;
 	ret = rados.ioctx_create2(pp.pool, target_io_ctx);
@@ -496,8 +566,8 @@ void ChunkScrub::chunk_scrub_common()
 
 	ret = cls_cas_references_chunk(target_io_ctx, pp.oid.name, oid);
 	if (ret == -ENOENT) {
-	  cerr << oid << " ref " << pp
-	       << ": referencing object missing" << std::endl;
+//	  cerr << oid << " ref " << pp
+//	       << ": referencing object missing" << std::endl;
 	  ++object_missing;
 	} else if (ret == -ENOLINK) {
 	  cerr << oid << " ref " << pp
@@ -505,6 +575,8 @@ void ChunkScrub::chunk_scrub_common()
 	       << std::endl;
 	  ++does_not_ref;
 	}
+      }
+
       }
       if (pool_missing || object_missing || does_not_ref) {
 	++damaged_objects;
@@ -1380,6 +1452,7 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
   librados::pool_stat_t s; 
   list<string> pool_names;
   map<string, librados::pool_stat_t> stats;
+  bool fixed = false;   // for fixed scrub test
 
   i = opts.find("op_name");
   if (i != opts.end()) {
@@ -1407,7 +1480,13 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
     if (rados_sistrtoll(i, &report_period)) {
       return -EINVAL;
     }
-  } 
+  }
+  // for fixed scrub test
+  i = opts.find("fixed");
+  if (i != opts.end()) {
+    fixed = true;
+  }
+
   i = opts.find("pgid");
   boost::optional<pg_t> pgid(i != opts.end(), pg_t());
 
@@ -1510,8 +1589,8 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
 	     << std::endl;
 	return chunk_ref;
       }
-      cout << object_name << " has " << chunk_ref << " references for "
-	   << target_object_name << std::endl;
+//      cout << object_name << " has " << chunk_ref << " references for "
+//	   << target_object_name << std::endl;
 
       // read object on base pool to know the number of chunk object's references
       base_ref = cls_cas_references_chunk(io_ctx, target_object_name, object_name);
@@ -1522,16 +1601,16 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
 	  return base_ref;
 	}
       }
-      cout << target_object_name << " has " << base_ref << " references for "
-	   << object_name << std::endl;
+//      cout << target_object_name << " has " << base_ref << " references for "
+//	   << object_name << std::endl;
       if (chunk_ref != base_ref) {
 	if (base_ref > chunk_ref) {
 	  cerr << "error : " << target_object_name << "'s ref. < " << object_name
 	       << "' ref. " << std::endl;
 	  return -EINVAL;
 	}
-	cout << " fix dangling reference from " << chunk_ref << " to " << base_ref
-	     << std::endl;
+//	cout << " fix dangling reference from " << chunk_ref << " to " << base_ref
+//	     << std::endl;
 	while (base_ref != chunk_ref) {
 	  ObjectWriteOperation op;
 	  cls_cas_chunk_put_ref(op, oid);
@@ -1587,7 +1666,7 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
   for (unsigned i = 0; i < max_thread; i++) {
     std::unique_ptr<CrawlerThread> ptr (
       new ChunkScrub(io_ctx, i, max_thread, begin, end, chunk_io_ctx,
-		     report_period, s.num_objects));
+		     report_period, s.num_objects, fixed));
     ptr->create("estimate_thread");
     estimate_threads.push_back(move(ptr));
   }
@@ -2161,6 +2240,8 @@ int main(int argc, const char **argv)
       opts["shallow-crawling"] = true;
     } else if (ceph_argparse_flag(args, i, "--debug", (char*)NULL)) {
       opts["debug"] = "true";
+    } else if (ceph_argparse_flag(args, i, "--fixed", (char*) NULL)) {
+      opts["fixed"] = "true";
     } else {
       if (val[0] == '-') {
 	cerr << "unrecognized option " << val << std::endl;
