@@ -226,6 +226,8 @@ public:
   friend class EstimateDedupRatio;
   friend class ChunkScrub;
   friend class SampleDedup;
+  friend class AddRef;
+  friend class DedupAll;
 };
 
 class EstimateDedupRatio : public CrawlerThread
@@ -256,17 +258,70 @@ public:
   void estimate_dedup_ratio();
 };
 
+class AddRef : public CrawlerThread
+{
+  IoCtx chunk_io_ctx;
+  uint64_t target_pool_id;
+  string target_obj_name;
+  bool is_sub = false;
+  
+public:
+  AddRef(IoCtx& io_ctx, int n, int m, ObjectCursor begin, ObjectCursor end,
+         IoCtx& chunk_io_ctx, int32_t report_period, uint64_t num_objects,
+         uint64_t target_pool_id, string target_obj_name, bool is_sub):
+    CrawlerThread(io_ctx, n, m, begin, end, report_period, num_objects),
+    chunk_io_ctx(chunk_io_ctx),
+    target_pool_id(target_pool_id),
+    target_obj_name(target_obj_name),
+    is_sub(is_sub)
+  {}
+  void* entry() {
+    do_add_ref();
+    return NULL;
+  }
+  void do_add_ref();
+};
+
+class DedupAll : public CrawlerThread
+{
+  IoCtx chunk_io_ctx;
+  string fp_algorithm;
+  uint32_t chunk_size;
+  uint32_t num_objs;
+  
+public:
+  DedupAll(IoCtx& io_ctx, int n, int m, ObjectCursor begin, ObjectCursor end,
+           IoCtx& chunk_io_ctx, int32_t report_period, uint64_t num_objects,
+           string fp_algorithm, uint32_t chunk_size):
+    CrawlerThread(io_ctx, n, m, begin, end, report_period, num_objects),
+    chunk_io_ctx(chunk_io_ctx),
+    fp_algorithm(fp_algorithm),
+    chunk_size(chunk_size)
+  {}
+
+  void* entry() {
+    do_dedup_all();
+    return NULL;
+  }
+  void do_dedup_all();
+};
+
 class ChunkScrub: public CrawlerThread
 {
   IoCtx chunk_io_ctx;
   int damaged_objects = 0;
   bool fixed = false;
+  bool scrub_and_repair = false;
+  uint64_t base_pool_id = 0xFFFFFFFFFFFFFFFF;
 
 public:
   ChunkScrub(IoCtx& io_ctx, int n, int m, ObjectCursor begin, ObjectCursor end, 
-	     IoCtx& chunk_io_ctx, int32_t report_period, uint64_t num_objects, bool fixed):
+	     IoCtx& chunk_io_ctx, int32_t report_period, uint64_t num_objects, 
+             bool fixed, bool scrub_and_repair, uint64_t base_pool_id):
     CrawlerThread(io_ctx, n, m, begin, end, report_period, num_objects), chunk_io_ctx(chunk_io_ctx),
-    fixed(fixed)
+    fixed(fixed),
+    scrub_and_repair(scrub_and_repair),
+    base_pool_id(base_pool_id)
     { }
   void* entry() {
     chunk_scrub_common();
@@ -396,6 +451,7 @@ void EstimateDedupRatio::estimate_dedup_ratio()
       }
       examined_objects++;
       examined_bytes += bl.length();
+//      cout << "oid : " << oid << " size : " << bl.length() << std::endl;
 
       // do the chunking
       for (auto& i : dedup_estimates) {
@@ -410,6 +466,204 @@ void EstimateDedupRatio::estimate_dedup_ratio()
 	  }
 	}
 	++i.second.total_objects;
+      }
+    }
+  }
+}
+
+int do_chunk_repair(IoCtx chunk_io_ctx, string chunk_obj_name, 
+                    IoCtx target_io_ctx, hobject_t target_oid) 
+{
+  auto run_op = [] (ObjectWriteOperation& op, hobject_t& oid,
+    string& object_name, IoCtx& chunk_io_ctx) -> int {
+    int ret = chunk_io_ctx.operate(object_name, &op);
+    if (ret < 0) {
+      cerr << " operate fail : " << cpp_strerror(ret) << std::endl;
+    }
+    return ret;
+  };
+
+  int chunk_ref = -1, base_ref = -1;
+  // read object on chunk pool to know how many reference the object has
+  bufferlist t;
+  int ret = chunk_io_ctx.getxattr(chunk_obj_name, CHUNK_REFCOUNT_ATTR, t);
+  if (ret < 0) {
+    return ret;
+  }
+  chunk_refs_t refs;
+  auto p = t.cbegin();
+  decode(refs, p);
+  if (refs.get_type() != chunk_refs_t::TYPE_BY_OBJECT) {
+    cerr << " does not supported chunk type " << std::endl;
+    return -1;
+  }
+  chunk_ref =
+    static_cast<chunk_refs_by_object_t*>(refs.r.get())->by_object.count(target_oid);
+  if (chunk_ref < 0) {
+    cerr << chunk_obj_name << " has no reference of " << target_oid.oid.name
+         << std::endl;
+    return chunk_ref;
+  }
+
+  // read object on base pool to know the number of chunk object's references
+  base_ref = cls_cas_references_chunk(target_io_ctx, target_oid.oid.name, chunk_obj_name);
+
+//  cout << "base_ref: " << base_ref << "  chunk_ref: " << chunk_ref << std::endl;
+
+  if (base_ref < 0) {
+    if (base_ref == -ENOENT || base_ref == -ENOLINK) {
+      base_ref = 0;
+    } else {
+      return base_ref;
+    }
+  }
+  if (chunk_ref != base_ref) {
+    if (base_ref > chunk_ref) {
+      cerr << "error : " << target_oid.oid.name << "'s ref. < " << chunk_obj_name
+           << "' ref. " << std::endl;
+      return -EINVAL;
+    }
+    while (base_ref != chunk_ref) {
+      ObjectWriteOperation op;
+      cls_cas_chunk_put_ref(op, target_oid);
+      chunk_ref--;
+      ret = run_op(op, target_oid, chunk_obj_name, chunk_io_ctx);
+      if (ret < 0) {
+        cout << " run_op fail" << std::endl;
+        return ret;
+      }
+    }
+  }
+
+  return ret;
+}
+
+static int make_manifest_object_and_flush(std::string& oid,
+                                   IoCtx& io_ctx,
+                                   IoCtx& chunk_io_ctx);
+void DedupAll::do_dedup_all() 
+{
+  cout << "dedup all start" << std::endl;
+  ObjectCursor shard_start;
+  ObjectCursor shard_end;
+  int ret;
+  Rados rados;
+  uint32_t num_deduped = 0;
+
+  ret = rados.init_with_context(g_ceph_context);
+  if (ret < 0) {
+     cerr << "couldn't initialize rados: " << cpp_strerror(ret) << std::endl;
+     return;
+  }
+  ret = rados.connect();
+  if (ret) {
+     cerr << "couldn't connect to cluster: " << cpp_strerror(ret) << std::endl;
+     return;
+  }
+
+  io_ctx.object_list_slice(
+    begin,
+    end,
+    n,
+    m,
+    &shard_start,
+    &shard_end);
+
+  ObjectCursor c(shard_start);
+  while(c < shard_end)
+  {
+    std::vector<ObjectItem> result;
+    int r = io_ctx.object_list(c, shard_end, 12, {}, &result, &c);
+    if (r < 0 ) {
+      cerr << "error object_list : " << cpp_strerror(r) << std::endl;
+      return;
+    }
+
+    for (const auto & i : result) {
+      auto obj_name = i.oid;
+      string obj_prefix;
+      stringstream ss(obj_name);
+      getline(ss, obj_prefix, '.');
+      if (obj_prefix != "rbd_data") {
+        continue;
+      }
+    
+      ret = make_manifest_object_and_flush(obj_name, io_ctx, chunk_io_ctx);
+      if (ret < 0) {
+        cerr << __func__ << " failed\n";
+        return;
+      }
+
+      // tier-flush to perform deduplication
+      ObjectReadOperation flush_op;
+      flush_op.tier_flush();
+      ret = io_ctx.operate(obj_name, &flush_op, NULL);
+      if (ret < 0) {
+        cerr << " tier_flush fail : " << cpp_strerror(ret) << std::endl;
+        return;
+      }
+
+      num_deduped++;
+    }
+  }
+
+  cout << "dedup " << num_deduped << " done" << std::endl;
+}
+
+void AddRef::do_add_ref()
+{
+  ObjectCursor shard_start;
+  ObjectCursor shard_end;
+  int ret;
+  Rados rados;
+
+  ret = rados.init_with_context(g_ceph_context);
+  if (ret < 0) {
+     cerr << "couldn't initialize rados: " << cpp_strerror(ret) << std::endl;
+     return;
+  }
+  ret = rados.connect();
+  if (ret) {
+     cerr << "couldn't connect to cluster: " << cpp_strerror(ret) << std::endl;
+     return;
+  }
+
+  chunk_io_ctx.object_list_slice(
+    begin,
+    end,
+    n,
+    m,
+    &shard_start,
+    &shard_end);
+
+  ObjectCursor c(shard_start);
+  while(c < shard_end)
+  {
+    std::vector<ObjectItem> result;
+    int r = chunk_io_ctx.object_list(c, shard_end, 12, {}, &result, &c);
+    if (r < 0 ) {
+      cerr << "error object_list : " << cpp_strerror(r) << std::endl;
+      return;
+    }
+
+    for (const auto & i : result) {
+      auto obj_name = i.oid;
+      uint32_t hash;
+      ret = chunk_io_ctx.get_object_hash_position2(obj_name, &hash);
+      if (ret < 0) {
+        cerr << " failed to get hash position oid: " << obj_name << std::endl;
+        return;
+      }
+      hobject_t dummy_oid(sobject_t(target_obj_name, CEPH_NOSNAP), "", hash, target_pool_id, "");
+
+      ObjectWriteOperation op;
+      if (is_sub)
+        cls_cas_chunk_put_ref(op, dummy_oid);
+      else
+        cls_cas_chunk_get_ref(op, dummy_oid);
+      ret = chunk_io_ctx.operate(obj_name, &op);
+      if (ret < 0) {
+        cerr << " operate fail : " << cpp_strerror(ret) << std::endl;
       }
     }
   }
@@ -446,7 +700,7 @@ void ChunkScrub::chunk_scrub_common()
   {
     std::vector<ObjectItem> result;
     int r = chunk_io_ctx.object_list(c, shard_end, 12, {}, &result, &c);
-    if (r < 0 ){
+    if (r < 0 ) {
       cerr << "error object_list : " << cpp_strerror(r) << std::endl;
       return;
     }
@@ -460,7 +714,6 @@ void ChunkScrub::chunk_scrub_common()
 	return;
       }
       auto oid = i.oid;
-//      cout << "chunk oid : " << oid << std::endl;
       chunk_refs_t refs;
       {
 	bufferlist t;
@@ -489,70 +742,87 @@ void ChunkScrub::chunk_scrub_common()
 
       // Test code for Fixed scrub
       if (fixed) {
-//        cout << " **** Start Fixed Scrub ****" << std::endl;
-        bool ref_find = false;
-        int num_base_pool_objs = 0;
+        if (base_pool_id == 0xFFFFFFFFFFFFFFFF) {
+          cerr << "Invalid base_pool_id" << std::endl;
+          return;
+        }
+
         for (auto& pp : byo->by_object) {
           IoCtx target_io_ctx;
           ret = rados.ioctx_create2(pp.pool, target_io_ctx);
           if (ret < 0) {
             cerr << oid << " ref " << pp
-                << ": referencing pool does not exist" << std::endl;
+                 << ": referencing pool does not exist" << std::endl;
+            ++pool_missing;
             continue;
           }
- 
-          ObjectCursor src_shard_start;
-          ObjectCursor src_shard_end;
-          ObjectCursor src_begin;
-          ObjectCursor src_end;
-          src_begin = target_io_ctx.object_list_begin();
-          src_end = target_io_ctx.object_list_end();
 
-          target_io_ctx.object_list_slice(
-            src_begin,
-            src_end,
-            1,
-            1,
-            &src_shard_start,
-            &src_shard_end);
-          ObjectCursor c(src_shard_start);
-          while (c < src_shard_end) {
-            std::vector<ObjectItem> result;
-            int r = target_io_ctx.object_list(c, src_shard_end, 100, {}, &result, &c);
-            if (r < 0) {
-              cerr << "error object_list: " << cpp_strerror(r) << std::endl;
-              return;
-            }
+        bool ref_find = false;
+        ObjectCursor src_shard_start;
+        ObjectCursor src_shard_end;
+        ObjectCursor src_begin;
+        ObjectCursor src_end;
+//        IoCtx target_io_ctx;
+//        ret = rados.ioctx_create2(base_pool_id, target_io_ctx);
+        src_begin = target_io_ctx.object_list_begin();
+        src_end = target_io_ctx.object_list_end();
 
-            num_base_pool_objs += result.size();
-//            cout << "  slice size : " << result.size() << std::endl;
+        target_io_ctx.object_list_slice(
+          src_begin,
+          src_end,
+          1,
+          1,
+          &src_shard_start,
+          &src_shard_end);
+        ObjectCursor c(src_shard_start);
+        string missing_oid;
+        while (c < src_shard_end) {
+          std::vector<ObjectItem> target_result;
+          int r = target_io_ctx.object_list(c, src_shard_end, 100, {}, &target_result, &c);
+          if (r < 0) {
+            cerr << "error object_list: " << cpp_strerror(r) << std::endl;
+            return;
+          }
 
-            for (const auto &i : result) {
-//              cout << "    pp.oid.name (ref): " << pp.oid.name << std::endl;
-//              cout << "    i.oid (base-pool) : " << i.oid << std::endl;
-              // compare between src object of chunk object and base pol object
-              if (i.oid == pp.oid.name) { 
-                ref_find = true;
-//                cout << "      FIND!" << std::endl;
-                break;
-              }
-//              cout << "      NOT FOUND" << std::endl;
-            }
-            if (ref_find) {
-              ref_find = false;
+          for (const auto &i : target_result) {
+//            cout << "    pp.oid.name (target): " << pp.oid.name << std::endl;
+//            cout << "    i.oid (chunk) : " << i.oid << std::endl;
+            // compare between src object of chunk object and base pol object
+            if (i.oid == oid) { 
+              ref_find = true;
               break;
             }
           }
+          if (ref_find) {
+            break;
+          }
         }
 
-        if (!ref_find) {
-//          cout << "  " << oid << " is damaged" << std::endl;
+        if (ref_find) {
+          ref_find = false;
+          break;
+        } else {
           ++object_missing;
+          if (scrub_and_repair) {
+            uint32_t hash;
+            ret = chunk_io_ctx.get_object_hash_position2(oid, &hash);
+            if (ret < 0) {
+              return;
+            }
+//            hobject_t target_oid(sobject_t(oid, CEPH_NOSNAP), "", hash, base_pool_id, "");
+            ret = do_chunk_repair(chunk_io_ctx, oid, target_io_ctx, pp);
+            if (ret < 0) {
+              cerr << "Error do_chunk_repair: " << cpp_strerror(ret) << std::endl;
+            }
+          }
         }
-        
-        // WILL BE DELETED
-//        cout << " total base pool object  = " << num_base_pool_objs << std::endl;
-      } else {
+
+        // oid is damaged. reference not found
+//        if (!ref_find) {
+//          ++object_missing;
+//        }
+        }
+      } else {  // TiDedup scrub
 
       for (auto& pp : byo->by_object) {
 	IoCtx target_io_ctx;
@@ -569,6 +839,13 @@ void ChunkScrub::chunk_scrub_common()
 //	  cerr << oid << " ref " << pp
 //	       << ": referencing object missing" << std::endl;
 	  ++object_missing;
+
+          if (scrub_and_repair) {
+            int r = do_chunk_repair(chunk_io_ctx, oid, target_io_ctx, pp);
+            if (r < 0) {
+              cerr << "Error do_chunk_repair: " << cpp_strerror(r) << std::endl;
+            }
+          }
 	} else if (ret == -ENOLINK) {
 	  cerr << oid << " ref " << pp
 	       << ": referencing object does not reference chunk"
@@ -577,9 +854,10 @@ void ChunkScrub::chunk_scrub_common()
 	}
       }
 
-      }
+      
       if (pool_missing || object_missing || does_not_ref) {
 	++damaged_objects;
+      }
       }
     }
   }
@@ -1436,6 +1714,233 @@ static void print_chunk_scrub()
   cout << " Damaged object : " << damaged_objects << std::endl;
 }
 
+int dedup_all(const std::map<std::string, std::string> &opts,
+              std::vector<const char*> &nargs)
+{
+  Rados rados;
+  IoCtx io_ctx, chunk_io_ctx;
+  std::string target_object_name;
+  string pool_name, chunk_pool_name;
+  string fp_algo;
+  uint32_t chunk_size;
+  int ret;
+  unsigned max_thread = default_max_thread;
+  std::map<std::string, std::string>::const_iterator i;
+  ObjectCursor begin;
+  ObjectCursor end;
+  uint32_t report_period = default_report_period;
+  list<string> pool_names;
+  map<string, librados::pool_stat_t> stats;
+  librados::pool_stat_t s;
+
+  i = opts.find("pool");
+  if (i != opts.end()) {
+    pool_name = i->second;
+  } else {
+    cerr << "must specify --pool" << std::endl;
+    exit(1);
+  }
+  i = opts.find("chunk-pool");
+  if (i != opts.end()) {
+    chunk_pool_name = i->second.c_str();
+  } else {
+    cerr << "must specify --chunk-pool" << std::endl;
+    exit(1);
+  }
+  i = opts.find("max-thread");
+  if (i != opts.end()) {
+    if (rados_sistrtoll(i, &max_thread)) {
+      return -EINVAL;
+    }
+  }
+  i = opts.find("fingerprint-algorithm");
+  if (i != opts.end()) {
+    fp_algo = i->second.c_str();
+    if (fp_algo != "sha1"
+        && fp_algo != "sha256" && fp_algo != "sha512") {
+      cerr << "unrecognized fingerprint-algorithm " << fp_algo << std::endl;
+      exit(1);
+    }
+  }
+  i = opts.find("dedup-cdc-chunk-size");
+  if (i != opts.end()) {
+    if (rados_sistrtoll(i, &chunk_size)) {
+      cerr << "unrecognized dedup_cdc_chunk_size " << chunk_size << std::endl;
+      return -EINVAL;
+    }
+  }
+
+  ret = rados.init_with_context(g_ceph_context);
+  if (ret < 0) {
+     cerr << "couldn't initialize rados: " << cpp_strerror(ret) << std::endl;
+     return ret;
+  }
+  ret = rados.connect();
+  if (ret) {
+     cerr << "couldn't connect to cluster: " << cpp_strerror(ret) << std::endl;
+     ret = -1;
+     return ret;
+  }
+  ret = rados.ioctx_create(pool_name.c_str(), io_ctx);
+  if (ret < 0) {
+    cerr << "error opening pool "
+         << chunk_pool_name << ": "
+         << cpp_strerror(ret) << std::endl;
+    return ret;
+  }
+  ret = rados.ioctx_create(chunk_pool_name.c_str(), chunk_io_ctx);
+  if (ret < 0) {
+    cerr << "error opening pool "
+         << chunk_pool_name << ": "
+         << cpp_strerror(ret) << std::endl;
+    return ret;
+  }
+
+  glock.lock();
+  begin = io_ctx.object_list_begin();
+  end = io_ctx.object_list_end();
+  pool_names.push_back(pool_name);
+  ret = rados.get_pool_stats(pool_names, stats);
+  if (ret < 0) {
+    cerr << "error fetching pool stats: " << cpp_strerror(ret) << std::endl;
+    glock.unlock();
+    return ret;
+  }
+  if (stats.find(pool_name) == stats.end()) {
+    cerr << "stats can not find pool name: " << chunk_pool_name << std::endl;
+    glock.unlock();
+    return ret;
+  }
+  s = stats[pool_name];
+
+  for (unsigned i = 0; i < max_thread; i++) {
+    std::unique_ptr<CrawlerThread> ptr (
+      new DedupAll(io_ctx, i, max_thread, begin, end, chunk_io_ctx,
+                 report_period, s.num_objects, fp_algo, chunk_size));
+    ptr->create("dedup thread");
+    estimate_threads.push_back(move(ptr));
+  }
+  glock.unlock();
+
+  for (auto &p : estimate_threads) {
+    cout << "join " << std::endl;
+    p->join();
+    cout << "joined " << std::endl;
+  }
+
+  cout << "Dedup all metadata objects done" << std::endl;
+  return 0;
+}
+
+int add_ref_all_chunk(const std::map<std::string, std::string> &opts,
+                        std::vector<const char*> &nargs)
+{
+  Rados rados;
+  IoCtx io_ctx, chunk_io_ctx;
+  std::string target_object_name;
+  string chunk_pool_name;
+  int ret;
+  unsigned max_thread = default_max_thread;
+  std::map<std::string, std::string>::const_iterator i;
+  ObjectCursor begin;
+  ObjectCursor end;
+  uint64_t target_pool_id;
+  uint32_t report_period = default_report_period;
+  list<string> pool_names;
+  map<string, librados::pool_stat_t> stats;
+  librados::pool_stat_t s;
+  bool is_sub = false;
+
+  i = opts.find("chunk-pool");
+  if (i != opts.end()) {
+    chunk_pool_name = i->second.c_str();
+  } else {
+    cerr << "must specify --chunk-pool" << std::endl;
+    exit(1);
+  }
+  i = opts.find("max-thread");
+  if (i != opts.end()) {
+    if (rados_sistrtoll(i, &max_thread)) {
+      return -EINVAL;
+    }
+  }
+  i = opts.find("target-ref");
+  if (i != opts.end()) {
+    target_object_name = i->second.c_str();
+  } else {
+    cerr << "must specify target ref" << std::endl;
+    exit(1);
+  }
+  i = opts.find("target-ref-pool-id");
+  if (i != opts.end()) {
+    if (rados_sistrtoll(i, &target_pool_id)) {
+      return -EINVAL;
+    }
+  } else {
+    cerr << "must specify target-ref-pool-id" << std::endl;
+    exit(1);
+  }
+  i = opts.find("sub-all-chunk");
+  if (i != opts.end()) {
+    is_sub = true;
+  }
+
+  ret = rados.init_with_context(g_ceph_context);
+  if (ret < 0) {
+     cerr << "couldn't initialize rados: " << cpp_strerror(ret) << std::endl;
+     return ret;
+  }
+  ret = rados.connect();
+  if (ret) {
+     cerr << "couldn't connect to cluster: " << cpp_strerror(ret) << std::endl;
+     ret = -1;
+     return ret;
+  }
+  ret = rados.ioctx_create(chunk_pool_name.c_str(), chunk_io_ctx);
+  if (ret < 0) {
+    cerr << "error opening pool "
+         << chunk_pool_name << ": "
+         << cpp_strerror(ret) << std::endl;
+    return ret;
+  }
+
+  glock.lock();
+  begin = chunk_io_ctx.object_list_begin();
+  end = chunk_io_ctx.object_list_end();
+  pool_names.push_back(chunk_pool_name);
+  ret = rados.get_pool_stats(pool_names, stats);
+  if (ret < 0) {
+    cerr << "error fetching pool stats: " << cpp_strerror(ret) << std::endl;
+    glock.unlock();
+    return ret;
+  }
+  if (stats.find(chunk_pool_name) == stats.end()) {
+    cerr << "stats can not find pool name: " << chunk_pool_name << std::endl;
+    glock.unlock();
+    return ret;
+  }
+  s = stats[chunk_pool_name];
+
+  for (unsigned i = 0; i < max_thread; i++) {
+    std::unique_ptr<CrawlerThread> ptr (
+      new AddRef(io_ctx, i, max_thread, begin, end, chunk_io_ctx,
+                 report_period, s.num_objects, target_pool_id, target_object_name,
+                 is_sub));
+    ptr->create("add-ref thread");
+    estimate_threads.push_back(move(ptr));
+  }
+  glock.unlock();
+
+  for (auto &p : estimate_threads) {
+    cout << "join " << std::endl;
+    p->join();
+    cout << "joined " << std::endl;
+  }
+
+  cout << "Add reference to all chunk objects done" << std::endl;
+  return 0;
+}
+
 int chunk_scrub_common(const std::map < std::string, std::string > &opts,
 			  std::vector<const char*> &nargs)
 {
@@ -1453,6 +1958,7 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
   list<string> pool_names;
   map<string, librados::pool_stat_t> stats;
   bool fixed = false;   // for fixed scrub test
+  bool scrub_and_repair = false;  // for repair test
 
   i = opts.find("op_name");
   if (i != opts.end()) {
@@ -1486,6 +1992,11 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
   if (i != opts.end()) {
     fixed = true;
   }
+  // for repair test
+  i = opts.find("scrub-and-repair");
+  if (i != opts.end()) {
+    scrub_and_repair = true;
+  }
 
   i = opts.find("pgid");
   boost::optional<pg_t> pgid(i != opts.end(), pg_t());
@@ -1509,11 +2020,11 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
     goto out;
   }
 
+  uint64_t pool_id;
   if (op_name == "chunk-get-ref" ||
       op_name == "chunk-put-ref" ||
       op_name == "chunk-repair") {
     string target_object_name;
-    uint64_t pool_id;
     i = opts.find("object");
     if (i != opts.end()) {
       object_name = i->second.c_str();
@@ -1583,14 +2094,11 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
 	return -1;
       }
       chunk_ref =
-	static_cast<chunk_refs_by_object_t*>(refs.r.get())->by_object.count(oid);
-      if (chunk_ref < 0) {
+	static_cast<chunk_refs_by_object_t*>(refs.r.get())->by_object.count(oid); if (chunk_ref < 0) {
 	cerr << object_name << " has no reference of " << target_object_name
 	     << std::endl;
 	return chunk_ref;
       }
-//      cout << object_name << " has " << chunk_ref << " references for "
-//	   << target_object_name << std::endl;
 
       // read object on base pool to know the number of chunk object's references
       base_ref = cls_cas_references_chunk(io_ctx, target_object_name, object_name);
@@ -1601,22 +2109,17 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
 	  return base_ref;
 	}
       }
-//      cout << target_object_name << " has " << base_ref << " references for "
-//	   << object_name << std::endl;
       if (chunk_ref != base_ref) {
 	if (base_ref > chunk_ref) {
 	  cerr << "error : " << target_object_name << "'s ref. < " << object_name
 	       << "' ref. " << std::endl;
 	  return -EINVAL;
 	}
-//	cout << " fix dangling reference from " << chunk_ref << " to " << base_ref
-//	     << std::endl;
 	while (base_ref != chunk_ref) {
 	  ObjectWriteOperation op;
 	  cls_cas_chunk_put_ref(op, oid);
 	  chunk_ref--;
-	  ret = run_op(op, oid, object_name, chunk_io_ctx);
-	  if (ret < 0) {
+	  ret = run_op(op, oid, object_name, chunk_io_ctx); if (ret < 0) {
 	    return ret;
 	  }
 	}
@@ -1646,6 +2149,18 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
     return 0;
   }
 
+  if (fixed) {
+    i = opts.find("target-ref-pool-id");
+    if (i != opts.end()) {
+      if (rados_sistrtoll(i, &pool_id)) {
+        return -EINVAL;
+      }
+    } else {
+      cerr << "must specify target-ref-pool-id" << std::endl;
+      exit(1);
+    }
+  }
+
   glock.lock();
   begin = chunk_io_ctx.object_list_begin();
   end = chunk_io_ctx.object_list_end();
@@ -1663,10 +2178,15 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
   }
   s = stats[chunk_pool_name];
 
+  if (scrub_and_repair)
+    cout << "Chunk repair start " << s.num_objects << " chunk objects" << std::endl;
+  else
+    cout << "Chunk scrub start " << s.num_objects << " chunk objects" << std::endl;
+
   for (unsigned i = 0; i < max_thread; i++) {
     std::unique_ptr<CrawlerThread> ptr (
       new ChunkScrub(io_ctx, i, max_thread, begin, end, chunk_io_ctx,
-		     report_period, s.num_objects, fixed));
+		     report_period, s.num_objects, fixed, scrub_and_repair, pool_id));
     ptr->create("estimate_thread");
     estimate_threads.push_back(move(ptr));
   }
@@ -1889,6 +2409,7 @@ int make_dedup_object(const std::map < std::string, std::string > &opts,
       goto out;
     }
 
+    /*
     // tier-evict
     ObjectReadOperation evict_op;
     evict_op.tier_evict();
@@ -1897,6 +2418,7 @@ int make_dedup_object(const std::map < std::string, std::string > &opts,
       cerr << " tier_evict fail : " << cpp_strerror(ret) << std::endl;
       goto out;
     }
+    */
   }
 
 out:
@@ -2240,8 +2762,12 @@ int main(int argc, const char **argv)
       opts["shallow-crawling"] = true;
     } else if (ceph_argparse_flag(args, i, "--debug", (char*)NULL)) {
       opts["debug"] = "true";
-    } else if (ceph_argparse_flag(args, i, "--fixed", (char*) NULL)) {
+    } else if (ceph_argparse_flag(args, i, "--fixed", (char*)NULL)) {
       opts["fixed"] = "true";
+    } else if (ceph_argparse_flag(args, i, "--scrub-and-repair", (char*)NULL)) {
+      opts["scrub-and-repair"] = "true";
+    } else if (ceph_argparse_flag(args, i, "--sub", (char*)NULL)) {
+      opts["sub-all-chunk"] = "true";
     } else {
       if (val[0] == '-') {
 	cerr << "unrecognized option " << val << std::endl;
@@ -2271,9 +2797,17 @@ int main(int argc, const char **argv)
      * perform deduplication on the entire object, not a chunk.
      *
      */
+//    time_t start = clock();
+//    int ret = make_dedup_object(opts, args);
+//    cout << ((double)(clock() - start) / CLOCKS_PER_SEC) << " sec" << std::endl;
+//    return ret;
     return make_dedup_object(opts, args);
   } else if (op_name == "sample-dedup") {
     return make_crawling_daemon(opts, args);
+  } else if (op_name == "add-ref-all-chunk") {
+    return add_ref_all_chunk(opts, args);
+  } else if (op_name == "dedup-all") {
+    return dedup_all(opts, args);
   } else {
     cerr << "unrecognized op " << op_name << std::endl;
     exit(1);
