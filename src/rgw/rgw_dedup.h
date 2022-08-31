@@ -19,7 +19,6 @@
 
 const int NUM_DEFAULT_WORKERS = 2;
 
-
 class RGWDedup : public DoutPrefixProvider {
   CephContext *cct;
   RGWRados *store;
