@@ -225,6 +225,13 @@ options:
   - rgw_enable_gc_threads
   - rgw_enable_quota_threads
   with_legacy: true
+- name: rgw_enable_dedup_threads
+  type: bool
+  level: advanced 
+  default: false
+  desc: Enables the dedup threads.
+  services:
+  - rgw
 - name: rgw_data
   type: str
   level: advanced
@@ -1144,6 +1151,14 @@ options:
   type: bool
   level: advanced
   desc: run sync thread in librgw (default off)
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_nfs_run_dedup_threads
+  type: bool
+  level: advanced
+  desc: run dedup threads in librgw (default off)
   default: false
   services:
   - rgw

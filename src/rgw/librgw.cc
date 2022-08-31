@@ -537,6 +537,10 @@ namespace rgw {
       g_conf()->rgw_run_sync_thread &&
       g_conf()->rgw_nfs_run_sync_thread;
 
+    auto run_dedup =
+      g_conf()->rgw_enable_dedup_threads &&
+      g_conf()->rgw_nfs_run_dedup_threads;
+
     StoreManager::Config cfg = StoreManager::get_config(false, g_ceph_context);
     store = StoreManager::get_storage(this, g_ceph_context,
 					 cfg,
@@ -544,7 +548,8 @@ namespace rgw {
 					 run_lc,
 					 run_quota,
 					 run_sync,
-					 g_conf().get_val<bool>("rgw_dynamic_resharding"));
+					 g_conf().get_val<bool>("rgw_dynamic_resharding"),
+					 run_dedup);
 
     if (!store) {
       mutex.lock();

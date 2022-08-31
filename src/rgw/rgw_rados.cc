@@ -64,6 +64,7 @@
 
 #include "rgw_gc.h"
 #include "rgw_lc.h"
+#include "rgw_dedup.h"
 
 #include "rgw_object_expirer_core.h"
 #include "rgw_sync.h"
@@ -1218,6 +1219,10 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
   if (ret < 0)
     return ret;
 
+  ret = open_dedup_chunk_pool_ctx(dpp);
+  if (ret < 0)
+    return ret;
+
   pools_initialized = true;
 
   if (use_gc) {
@@ -1232,6 +1237,15 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
   if (use_gc_thread && use_gc) {
     gc->start_processor();
     obj_expirer->start_processor();
+  }
+
+  if (use_dedup_threads) {
+    dedup = new RGWDedup();
+    dedup->initialize(cct, this);
+    dedup->start_processor();
+    std::cout << "RGWDedup initialized and started" << std::endl;
+  } else {
+    ldpp_dout(dpp, 5) << "note: Dedup not initialized" << dendl;
   }
 
   auto& current_period = svc.zone->get_current_period();
@@ -1354,6 +1368,8 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
     reshard->start_processor();
   }
 
+
+
   index_completion_manager = new RGWIndexCompletionManager(this);
   ret = rgw::notify::init(cct, store, dpp);
   if (ret < 0 ) {
@@ -1438,6 +1454,14 @@ int RGWRados::open_reshard_pool_ctx(const DoutPrefixProvider *dpp)
 int RGWRados::open_notif_pool_ctx(const DoutPrefixProvider *dpp)
 {
   return rgw_init_ioctx(dpp, get_rados_handle(), svc.zone->get_zone_params().notif_pool, notif_pool_ctx, true, true);
+}
+
+int RGWRados::open_dedup_chunk_pool_ctx(const DoutPrefixProvider *dpp)
+{
+  return rgw_init_ioctx(dpp, get_rados_handle(), 
+                        svc.zone->get_zone_params().dedup_chunk_pool, 
+                        dedup_chunk_pool_ctx, 
+                        true, true);
 }
 
 int RGWRados::open_pool_ctx(const DoutPrefixProvider *dpp, const rgw_pool& pool, librados::IoCtx& io_ctx,

@@ -1560,6 +1560,7 @@ public:
 				      bool quota_threads,
 				      bool run_sync_thread,
 				      bool run_reshard_thread,
+                                      bool use_dedup_threads,
 				      bool use_cache = true,
 				      bool use_gc = true) {
     rgw::sal::Store* store = init_storage_provider(dpp, cct, cfg, use_gc_thread,
@@ -1567,6 +1568,7 @@ public:
 						   quota_threads,
 						   run_sync_thread,
 						   run_reshard_thread,
+                                                   use_dedup_threads,
 						   use_cache, use_gc);
     return store;
   }
@@ -1585,6 +1587,7 @@ public:
 						bool quota_threads,
 						bool run_sync_thread,
 						bool run_reshard_thread,
+                                                bool use_dedup_threads,
 						bool use_metadata_cache,
 						bool use_gc);
   /** Initialize a new raw Store */

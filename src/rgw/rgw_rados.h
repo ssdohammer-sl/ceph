@@ -57,6 +57,7 @@ struct RGWZoneGroup;
 struct RGWZoneParams;
 class RGWReshard;
 class RGWReshardWait;
+class RGWDedup;
 
 struct get_obj_data;
 
@@ -338,6 +339,7 @@ class RGWRados
   friend class RGWReshard;
   friend class RGWBucketReshard;
   friend class RGWBucketReshardLock;
+  friend class RGWDedup;
   friend class BucketIndexLockGuard;
   friend class rgw::sal::MPRadosSerializer;
   friend class rgw::sal::LCRadosSerializer;
@@ -350,6 +352,7 @@ class RGWRados
   int open_objexp_pool_ctx(const DoutPrefixProvider *dpp);
   int open_reshard_pool_ctx(const DoutPrefixProvider *dpp);
   int open_notif_pool_ctx(const DoutPrefixProvider *dpp);
+  int open_dedup_chunk_pool_ctx(const DoutPrefixProvider * dpp);
 
   int open_pool_ctx(const DoutPrefixProvider *dpp, const rgw_pool& pool, librados::IoCtx&  io_ctx,
 		    bool mostly_omap);
@@ -362,11 +365,14 @@ class RGWRados
   RGWGC *gc = nullptr;
   RGWLC *lc;
   RGWObjectExpirer *obj_expirer;
+  RGWDedup *dedup = nullptr;
   bool use_gc_thread;
   bool use_lc_thread;
   bool quota_threads;
   bool run_sync_thread;
   bool run_reshard_thread;
+  bool use_dedup_threads;
+  bool run_dedup;
 
   RGWMetaNotifier *meta_notifier;
   RGWDataNotifier *data_notifier;
@@ -430,6 +436,7 @@ protected:
   librados::IoCtx objexp_pool_ctx;
   librados::IoCtx reshard_pool_ctx;
   librados::IoCtx notif_pool_ctx;     // .rgw.notif
+  librados::IoCtx dedup_chunk_pool_ctx;   // .rgw.default.chunk
 
   bool pools_initialized;
 
@@ -449,9 +456,9 @@ protected:
   int get_obj_head_ioctx(const DoutPrefixProvider *dpp, const RGWBucketInfo& bucket_info, const rgw_obj& obj, librados::IoCtx *ioctx);
 public:
   RGWRados(): timer(NULL),
-               gc(NULL), lc(NULL), obj_expirer(NULL), use_gc_thread(false), use_lc_thread(false), quota_threads(false),
-               run_sync_thread(false), run_reshard_thread(false), meta_notifier(NULL),
-               data_notifier(NULL), meta_sync_processor_thread(NULL),
+               gc(NULL), lc(NULL), obj_expirer(NULL), dedup(NULL), use_gc_thread(false), use_lc_thread(false),
+	       quota_threads(false), run_sync_thread(false), run_reshard_thread(false), use_dedup_threads(NULL),
+	       run_dedup(false), meta_notifier(NULL), data_notifier(NULL), meta_sync_processor_thread(NULL),
                bucket_index_max_shards(0),
                max_bucket_id(0), cct(NULL),
                binfo_cache(NULL), obj_tombstone_cache(nullptr),
@@ -488,6 +495,10 @@ public:
     return gc;
   }
 
+  RGWDedup *get_dedup() {
+    return dedup;
+  }
+
   RGWRados& set_run_gc_thread(bool _use_gc_thread) {
     use_gc_thread = _use_gc_thread;
     return *this;
@@ -500,6 +511,11 @@ public:
 
   RGWRados& set_run_quota_threads(bool _run_quota_threads) {
     quota_threads = _run_quota_threads;
+    return *this;
+  }
+
+  RGWRados& set_run_dedup_threads(bool _use_dedup_threads) {
+    use_dedup_threads = _use_dedup_threads;
     return *this;
   }
 
@@ -519,6 +535,10 @@ public:
 
   librados::IoCtx& get_notif_pool_ctx() {
     return notif_pool_ctx;
+  }
+
+  librados::IoCtx& get_dedup_chunk_pool_ctx() {
+    return dedup_chunk_pool_ctx;
   }
 
   void set_context(CephContext *_cct) {

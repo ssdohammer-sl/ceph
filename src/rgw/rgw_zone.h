@@ -371,7 +371,6 @@ struct RGWZoneParams : RGWSystemMetaObj {
   rgw_pool log_pool;
   rgw_pool intent_log_pool;
   rgw_pool usage_log_pool;
-
   rgw_pool user_keys_pool;
   rgw_pool user_email_pool;
   rgw_pool user_swift_pool;
@@ -380,6 +379,7 @@ struct RGWZoneParams : RGWSystemMetaObj {
   rgw_pool reshard_pool;
   rgw_pool otp_pool;
   rgw_pool oidc_pool;
+  rgw_pool dedup_chunk_pool;
 
   RGWAccessKey system_key;
 
