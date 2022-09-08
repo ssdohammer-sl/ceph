@@ -15,14 +15,17 @@
 #include "rgw_rados.h"
 #include "cls/rgw/cls_rgw_types.h"
 
+#include <string>
 #include <atomic>
+
+using namespace std;
 
 const int NUM_DEFAULT_WORKERS = 2;
 
 class RGWDedup : public DoutPrefixProvider {
   CephContext *cct;
   RGWRados *store;
-
+/*
   class DedupWorker : public Thread {
     const DoutPrefixProvider *dpp;
     CephContext *cct;
@@ -31,7 +34,6 @@ class RGWDedup : public DoutPrefixProvider {
     ceph::condition_variable cond;
     uint32_t id;
     bool run_dedup;
-    std::atomic<bool> down_flag = { false };
 
   public:
     DedupWorker(const DoutPrefixProvider *_dpp, CephContext *_cct, RGWDedup *_dedup, uint32_t _id)
@@ -42,23 +44,22 @@ class RGWDedup : public DoutPrefixProvider {
     void *entry() override;
     void stop();
   };
-
-  uint32_t num_workers;
+*/
+//  std::atomic<bool> down_flag = { false };
+  /*
+  uint32_t num_workers = NUM_DEFAULT_WORKERS;
   uint32_t dedup_period;
   double sampling_ratio;
   uint32_t chunk_size;
   uint32_t chunk_dedup_threshold;
   string fp_algo;
-  vector<std::unique_ptr<Thread>> worker_threads;
+  */
+//  vector<std::unique_ptr<DedupWorker>> worker_threads;
 
 public:
-  RGWDedup() 
-    : cct(NULL), 
-      store(NULL), 
-      num_workers(DEFAULT_NUM_WORKERS), 
-      worker(NULL)
-  {}
-  ~RGWDedup() {
+  RGWDedup() {}
+  RGWDedup() : cct(NULL), store(NULL) {}
+  virtual ~RGWDedup() {
     stop_processor();
     finalize();
   }
@@ -72,6 +73,7 @@ public:
   void stop_processor();
 
   CephContext *get_cct() const override { return store->ctx(); }
+  unsigned get_subsys() const;
   std::ostream& gen_prefix(std::ostream& out) const;
 
 };

@@ -228,8 +228,8 @@ options:
 - name: rgw_enable_dedup_threads
   type: bool
   level: advanced 
-  default: false
   desc: Enables the dedup threads.
+  default: false
   services:
   - rgw
 - name: rgw_data

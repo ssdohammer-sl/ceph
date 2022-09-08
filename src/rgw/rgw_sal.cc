@@ -90,7 +90,6 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
 						     bool quota_threads,
 						     bool run_sync_thread,
 						     bool run_reshard_thread,
-                                                     bool use_dedup,
                                                      bool use_dedup_threads,
 						     bool use_cache,
 						     bool use_gc)
@@ -109,8 +108,7 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
                 .set_run_quota_threads(quota_threads)
                 .set_run_sync_thread(run_sync_thread)
                 .set_run_reshard_thread(run_reshard_thread)
-                .set_use_dedup(use_dedup)
-                .set_run_dedup_threads(use_dedup_threads)
+                .set_use_dedup_threads(use_dedup_threads)
                 .init_begin(cct, dpp) < 0) {
       delete store;
       return nullptr;
@@ -137,8 +135,7 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
                 .set_run_quota_threads(quota_threads)
                 .set_run_sync_thread(run_sync_thread)
                 .set_run_reshard_thread(run_reshard_thread)
-                .set_use_dedup(use_dedup)
-                .set_run_dedup_thread(use_dedup_thread)
+                .set_use_dedup_threads(use_dedup_threads)
                 .init_begin(cct, dpp) < 0) {
       delete store;
       return nullptr;

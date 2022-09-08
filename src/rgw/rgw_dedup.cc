@@ -11,10 +11,7 @@
 #include "cls/version/cls_version_client.h"
 #include "rgw_perf_counters.h"
 #include "cls/lock/cls_lock_client.h"
-#include "include/random.h"
-#include "rgw_gc_log.h"
 
-#include <list>
 #include <sstream>
 
 #define dout_context g_ceph_context
@@ -31,8 +28,6 @@ void RGWDedup::initialize(CephContext *_cct, RGWRados *_store)
 {
   cct = _cct;
   store = _store;
-
-  num_workers = static_cast<uint32_t>(cct->_conf->rgw_gc_max_objs);
 }
 
 void RGWDedup::finalize()
@@ -58,16 +53,16 @@ void RGWDedup::start_processor()
 {
   for (auto i = 0; i < num_workers; i++) {
     ldpp_dout(this, 5) << "RGWDedup::start_processor creating dedup_worker " << i << dendl;
-    unique_ptr<Thread> worker_ptr (new DedupWorker());
-    worker_ptr->create("dedup_worker_" + i);
-    estimate_threads.push_back(move(worker_ptr));
+//    unique_ptr<Thread> worker_ptr (new DedupWorker());
+//    worker_ptr->create("dedup_worker_" + i);
+//    worker_threads.push_back(move(worker_ptr));
   }
   cout << num_workers << " threads are created" << endl;
 }
 
 void RGWDedup::stop_processor()
 {
-  down_flag = true;
+/*  down_flag = true;
   if (worker_threads.size() > 0) {
     for (auto i = 0; i < worker_threads.size(); i++) {
       if (worker_threads[i].get()) {
@@ -76,7 +71,7 @@ void RGWDedup::stop_processor()
       }
       worker_thread[i].reset();
     }
-  }
+  }*/
 }
 
 unsigned RGWDedup::get_subsys() const
@@ -88,7 +83,7 @@ std::ostream& RGWDedup::gen_prefix(std::ostream& out) const
 {
   return out << "RGWDedup: ";
 }
-
+/*
 // what dedup worker actually do
 void *RGWDedup::DedupWorker::entry()
 {
@@ -102,4 +97,4 @@ void RGWDedup::DedupWorker::stop()
   std::lock_guard l{lock};
   cond.notify_all();
 }
-
+*/

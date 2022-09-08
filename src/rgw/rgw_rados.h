@@ -514,7 +514,12 @@ public:
     return *this;
   }
 
-  RGWRados& set_run_dedup_threads(bool _use_dedup_threads) {
+  RGWRados& set_run_dedup(bool _run_dedup) {
+    run_dedup = _run_dedup;
+    return *this;
+  }
+
+  RGWRados& set_use_dedup_threads(bool _use_dedup_threads) {
     use_dedup_threads = _use_dedup_threads;
     return *this;
   }
