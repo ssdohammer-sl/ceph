@@ -232,6 +232,7 @@ options:
   default: false
   services:
   - rgw
+  with_legacy: true
 - name: rgw_data
   type: str
   level: advanced
