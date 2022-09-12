@@ -17,6 +17,9 @@
 
 #include <string>
 #include <atomic>
+#include <sstream>
+
+#define dout_subsys ceph_subsys_rgw
 
 using namespace std;
 
@@ -24,8 +27,9 @@ const int NUM_DEFAULT_WORKERS = 2;
 
 class RGWDedup : public DoutPrefixProvider {
   CephContext *cct;
-  RGWRados *store;
-/*
+//  RGWRados *store;
+  rgw::sal::Store* store;
+
   class DedupWorker : public Thread {
     const DoutPrefixProvider *dpp;
     CephContext *cct;
@@ -43,9 +47,11 @@ class RGWDedup : public DoutPrefixProvider {
     }
     void *entry() override;
     void stop();
+
+    friend class RGWDedup;
   };
-*/
-//  std::atomic<bool> down_flag = { false };
+
+  std::atomic<bool> down_flag = { false };
   /*
   uint32_t num_workers = NUM_DEFAULT_WORKERS;
   uint32_t dedup_period;
@@ -54,17 +60,14 @@ class RGWDedup : public DoutPrefixProvider {
   uint32_t chunk_dedup_threshold;
   string fp_algo;
   */
-//  vector<std::unique_ptr<DedupWorker>> worker_threads;
+  vector<std::unique_ptr<RGWDedup::DedupWorker>> worker_threads;
 
 public:
-  RGWDedup() {}
-  RGWDedup() : cct(NULL), store(NULL) {}
-  virtual ~RGWDedup() {
-    stop_processor();
-    finalize();
-  }
+//  RGWDedup() : cct(nullptr), store(nullptr) {}
+//  ~RGWDedup() override;
+//  ~RGWDedup();
 
-  void initialize(CephContext *_cct, RGWRados *_store);
+  void initialize(CephContext *_cct, rgw::sal::Store* _store);
   void finalize();
   int process();
 
@@ -72,10 +75,9 @@ public:
   void start_processor();
   void stop_processor();
 
-  CephContext *get_cct() const override { return store->ctx(); }
-  unsigned get_subsys() const;
-  std::ostream& gen_prefix(std::ostream& out) const;
-
+  CephContext *get_cct() const override { return cct; }
+  unsigned get_subsys() const override { return dout_subsys; }
+  std::ostream& gen_prefix(std::ostream& out) const override { return out << "RGWDedup: "; }
 };
 
 

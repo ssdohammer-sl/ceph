@@ -14,8 +14,8 @@
 
 #include <sstream>
 
-#define dout_context g_ceph_context
-#define dout_subsys ceph_subsys_rgw
+//#define dout_context g_ceph_context
+//#define dout_subsys ceph_subsys_rgw
 
 using namespace std;
 using namespace librados;
@@ -73,17 +73,15 @@ void RGWDedup::stop_processor()
     }
   }*/
 }
-
-unsigned RGWDedup::get_subsys() const
-{
-  return dout_subsys;
-}
-
-std::ostream& RGWDedup::gen_prefix(std::ostream& out) const
-{
-  return out << "RGWDedup: ";
-}
 /*
+RGWDedup::~RGWDedup()
+{
+  stop_processor();
+  finalize();
+}
+*/
+
+
 // what dedup worker actually do
 void *RGWDedup::DedupWorker::entry()
 {
@@ -97,4 +95,4 @@ void RGWDedup::DedupWorker::stop()
   std::lock_guard l{lock};
   cond.notify_all();
 }
-*/
+
