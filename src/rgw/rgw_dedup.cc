@@ -22,14 +22,15 @@ using namespace librados;
 
 static string dedup_oid_prefix = "dedup";
 static string dedup_index_lock_name = "dedup_process";
-
+/*
 // init member variables
-void RGWDedup::initialize(CephContext *_cct, RGWRados *_store)
+void RGWDedup::initialize(CephContext* _cct, rgw::sal::Store* _store)
 {
   cct = _cct;
   store = _store;
+  ldout(cct, 0) << __func__ << " initialize RGWDedup done" << dendl;
 }
-
+*/
 void RGWDedup::finalize()
 {
 

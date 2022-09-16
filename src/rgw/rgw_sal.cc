@@ -99,6 +99,11 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
   if (cfg.store_name.compare("rados") == 0) {
     store = newStore();
     RGWRados* rados = static_cast<rgw::sal::RadosStore* >(store)->getRados();
+    if (rados) {
+      ldout(cct, 0) << "create RadosStore done" << dendl;
+      ldout(cct, 0) << "run_dedup_threads: " << use_dedup_threads << dendl;
+    }
+    use_dedup_threads = true;
 
     if ((*rados).set_use_cache(use_cache)
                 .set_use_datacache(false)
@@ -117,10 +122,13 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
       delete store;
       return nullptr;
     }
+    ldout(cct, 0) << __func__ << " initialize RadosStore done" << dendl;
     if (rados->init_complete(dpp) < 0) {
+      ldout(cct, 0) << __func__ << " rados init_complete() fail" << dendl;
       delete store;
       return nullptr;
     }
+    ldout(cct, 0) << __func__ << " init_complete RGWRados done" << dendl;
   }
   else if (cfg.store_name.compare("d3n") == 0) {
     store = new rgw::sal::RadosStore();

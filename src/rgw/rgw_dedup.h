@@ -63,11 +63,17 @@ class RGWDedup : public DoutPrefixProvider {
   vector<std::unique_ptr<RGWDedup::DedupWorker>> worker_threads;
 
 public:
-//  RGWDedup() : cct(nullptr), store(nullptr) {}
+  RGWDedup() : cct(nullptr), store(nullptr) {
+  
+  }
 //  ~RGWDedup() override;
 //  ~RGWDedup();
 
-  void initialize(CephContext *_cct, rgw::sal::Store* _store);
+  void initialize(CephContext* _cct, rgw::sal::Store* _store) {
+    cct = _cct;
+    store = _store;
+    ldout(cct, 0) << __func__ << " initialize RGWDedup done" << dendl;
+  }
   void finalize();
   int process();
 

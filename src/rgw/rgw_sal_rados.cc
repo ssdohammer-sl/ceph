@@ -1245,6 +1245,8 @@ int RadosStore::get_raw_chunk_size(const DoutPrefixProvider* dpp, const rgw_raw_
 
 int RadosStore::initialize(CephContext *cct, const DoutPrefixProvider *dpp)
 {
+  ldout(cct, 0) << __func__ << " gc_pool: " << svc()->zone->get_zone_params().gc_pool.name << dendl;
+  ldout(cct, 0) << __func__ << " dedup_pool: " << svc()->zone->get_zone_params().dedup_chunk_pool.name << dendl;
   std::unique_ptr<ZoneGroup> zg =
     std::make_unique<RadosZoneGroup>(this, svc()->zone->get_zonegroup());
   zone = make_unique<RadosZone>(this, std::move(zg));

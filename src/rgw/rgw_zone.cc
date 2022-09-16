@@ -656,6 +656,8 @@ int RGWSystemMetaObj::read_info(const DoutPrefixProvider *dpp, const string& obj
 
   string oid = get_info_oid_prefix(old_format) + obj_id;
 
+  ldout(cct, 0) << __func__ << " oid: " << oid << dendl;
+
   auto sysobj = sysobj_svc->get_obj(rgw_raw_obj{pool, oid});
   int ret = sysobj.rop().read(dpp, &bl, y);
   if (ret < 0) {
@@ -1660,6 +1662,7 @@ void RGWZoneParams::dump(Formatter *f) const
   encode_json("tier_config", tier_config, f);
   encode_json("realm_id", realm_id, f);
   encode_json("notif_pool", notif_pool, f);
+  encode_json("dedup_chunk_pool", dedup_chunk_pool, f);
 }
 
 namespace {
@@ -1693,6 +1696,9 @@ int get_zones_pool_set(const DoutPrefixProvider *dpp,
       pool_names.insert(zone.roles_pool);
       pool_names.insert(zone.reshard_pool);
       pool_names.insert(zone.notif_pool);
+      ldpp_dout(dpp, 0) << "zone.notif_pool: " << zone.notif_pool.name << dendl;
+      pool_names.insert(zone.dedup_chunk_pool);
+      ldpp_dout(dpp, 0) << "zone.dedup_chunk_pool: " << zone.dedup_chunk_pool.name << dendl;
       for(auto& iter : zone.placement_pools) {
 	pool_names.insert(iter.second.index_pool);
         for (auto& pi : iter.second.storage_classes.get_all()) {
@@ -1753,6 +1759,8 @@ int RGWZoneParams::fix_pool_names(const DoutPrefixProvider *dpp, optional_yield 
     ldpp_dout(dpp, 0) << "Error: get_zones_pool_names" << r << dendl;
     return r;
   }
+  ldout(cct, 0) << __func__ << " gc_pool.to_str(): " << gc_pool.to_str() << dendl;
+  ldout(cct, 0) << __func__ << " dedup_pool.to_str(): " << dedup_chunk_pool.to_str() << dendl;
 
   domain_root = fix_zone_pool_dup(pools, name, ".rgw.meta:root", domain_root);
   control_pool = fix_zone_pool_dup(pools, name, ".rgw.control", control_pool);
@@ -1770,6 +1778,7 @@ int RGWZoneParams::fix_pool_names(const DoutPrefixProvider *dpp, optional_yield 
   otp_pool = fix_zone_pool_dup(pools, name, ".rgw.otp", otp_pool);
   oidc_pool = fix_zone_pool_dup(pools, name, ".rgw.meta:oidc", oidc_pool);
   notif_pool = fix_zone_pool_dup(pools, name ,".rgw.log:notif", notif_pool);
+  dedup_chunk_pool = fix_zone_pool_dup(pools, name, "rgw.dedup.chunk:dedup", dedup_chunk_pool);
 
   for(auto& iter : placement_pools) {
     iter.second.index_pool = fix_zone_pool_dup(pools, name, "." + default_bucket_index_pool_suffix,
@@ -2665,6 +2674,7 @@ void RGWZoneParams::decode_json(JSONObj *obj)
   JSONDecoder::decode_json("tier_config", tier_config, obj);
   JSONDecoder::decode_json("realm_id", realm_id, obj);
   JSONDecoder::decode_json("notif_pool", notif_pool, obj);
+  JSONDecoder::decode_json("dedup_chunk_pool", dedup_chunk_pool, obj);
 
 }
 

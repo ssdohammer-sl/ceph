@@ -1218,11 +1218,16 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
   ret = open_notif_pool_ctx(dpp);
   if (ret < 0)
     return ret;
+  ldpp_dout(dpp, 0) << "start to open dedup chunk pool" << dendl;
 
+/*  TODO need to create chunk pool
   ret = open_dedup_chunk_pool_ctx(dpp);
-  if (ret < 0)
+  if (ret < 0) {
+    ldpp_dout(dpp, 0) << __func__ << " failed to open dedup_chunk_pool" << dendl;
     return ret;
-
+  }
+  ldpp_dout(dpp, 0) << "open_dedup_chunk_pool_ctx done" << dendl;
+*/
   pools_initialized = true;
 
   if (use_gc) {
@@ -1239,14 +1244,17 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
     obj_expirer->start_processor();
   }
 
-//  if (use_dedup_threads) {
+  use_dedup_threads = true;
+  ldout(cct, 0) << __func__ << " use_dedup_threads: " << use_dedup_threads 
+    << "and init RGWDedup" << dendl;
+  if (use_dedup_threads) {
     dedup = new RGWDedup();
-//    dedup->initialize(cct, this);
+    dedup->initialize(cct, this->store);
 //    dedup->start_processor();
-    std::cout << "RGWDedup initialized and started" << std::endl;
-//  } else {
-//    ldpp_dout(dpp, 5) << "note: Dedup not initialized" << dendl;
-//  }
+    ldpp_dout(dpp, 0) << "RGWDedup initialized and started" << dendl;
+  } else {
+    ldpp_dout(dpp, 5) << "note: Dedup not initialized" << dendl;
+  }
 
   auto& current_period = svc.zone->get_current_period();
   auto& zonegroup = svc.zone->get_zonegroup();
@@ -1410,12 +1418,14 @@ int RGWRados::init_begin(const DoutPrefixProvider *dpp)
     ldpp_dout(dpp, 0) << "ERROR: failed to init services (ret=" << cpp_strerror(-ret) << ")" << dendl;
     return ret;
   }
+  ldout(cct, 0) << __func__ << " init services done" << dendl;
 
   ret = init_ctl(dpp);
   if (ret < 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to init ctls (ret=" << cpp_strerror(-ret) << ")" << dendl;
     return ret;
   }
+  ldout(cct, 0) << __func__ << " init ctls done" << dendl;
 
   host_id = svc.zone_utils->gen_host_id();
 
@@ -1458,6 +1468,10 @@ int RGWRados::open_notif_pool_ctx(const DoutPrefixProvider *dpp)
 
 int RGWRados::open_dedup_chunk_pool_ctx(const DoutPrefixProvider *dpp)
 {
+  ldpp_dout(dpp, 0) << __func__ << " open_dedup_chunk_pool_ctx(): svc_zone: " 
+    << svc.zone->get_zone_params().dedup_chunk_pool.name << dendl;
+  ldpp_dout(dpp, 0) << __func__ << " dedup_chunk_pool: " << svc.zone->get_zone_params().dedup_chunk_pool.name << dendl;
+
   return rgw_init_ioctx(dpp, get_rados_handle(), 
                         svc.zone->get_zone_params().dedup_chunk_pool, 
                         dedup_chunk_pool_ctx, 

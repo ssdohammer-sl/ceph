@@ -138,6 +138,7 @@ int RGWSI_Zone::do_start(optional_yield y, const DoutPrefixProvider *dpp)
     return ret;
   }
 
+  ldpp_dout(dpp, 0) << __func__ << " zone_params->init() start" << dendl;
   ret = zone_params->init(dpp, cct, sysobj_svc, y);
   bool found_zone = (ret == 0);
   if (ret < 0 && ret != -ENOENT) {
@@ -188,6 +189,7 @@ int RGWSI_Zone::do_start(optional_yield y, const DoutPrefixProvider *dpp)
     /* couldn't find a proper period config, use local zonegroup */
     ret = zonegroup->init(dpp, cct, sysobj_svc, y);
     zg_initialized = (ret == 0);
+    ldout(cct, 0) << __func__ << " zg initialized: " << zg_initialized << dendl;
     if (ret < 0 && ret != -ENOENT) {
       ldpp_dout(dpp, 0) << "failed reading zonegroup info: " << cpp_strerror(-ret) << dendl;
       return ret;
@@ -202,6 +204,7 @@ int RGWSI_Zone::do_start(optional_yield y, const DoutPrefixProvider *dpp)
       (!explicit_zg || zonegroup_param == default_zonegroup_name)) {
     /* we couldn't initialize any zonegroup,
        falling back to a non-multisite config with default zonegroup */
+    ldout(cct, 0) << __func__ << " start create_default_zg()" << dendl;
     ret = create_default_zg(dpp, y);
     if (ret < 0) {
       return ret;
@@ -240,18 +243,21 @@ int RGWSI_Zone::do_start(optional_yield y, const DoutPrefixProvider *dpp)
   }
 
   /* we have zone now */
+  ldout(cct, 0) << __func__ << " we have zone now" << dendl;
 
   ret = replace_region_with_zonegroup(dpp, y);
   if (ret < 0) {
     ldpp_dout(dpp, -1) << "failed converting region to zonegroup : ret "<< ret << " " << cpp_strerror(-ret) << dendl;
     return ret;
   }
+  ldout(cct, 0) << __func__ << "replace_region_with_zonegroup done" << dendl;
 
   ret = convert_regionmap(dpp, y);
   if (ret < 0) {
     ldpp_dout(dpp, -1) << "failed converting regionmap: " << cpp_strerror(-ret) << dendl;
     return ret;
   }
+  ldout(cct, 0) << __func__ << "convert_regionmap done" << dendl;
 
   auto zone_iter = zonegroup->zones.find(zone_params->get_id());
   if (zone_iter == zonegroup->zones.end()) {
@@ -269,20 +275,20 @@ int RGWSI_Zone::do_start(optional_yield y, const DoutPrefixProvider *dpp)
     return -EINVAL;
   }
   *zone_public_config = zone_iter->second;
-  ldout(cct, 20) << "zone " << zone_params->get_name() << " found"  << dendl;
+  ldout(cct, 0) << "zone " << zone_params->get_name() << " found"  << dendl;
 
-  ldpp_dout(dpp, 4) << "Realm:     " << std::left << setw(20) << realm->get_name() << " (" << realm->get_id() << ")" << dendl;
-  ldpp_dout(dpp, 4) << "ZoneGroup: " << std::left << setw(20) << zonegroup->get_name() << " (" << zonegroup->get_id() << ")" << dendl;
-  ldpp_dout(dpp, 4) << "Zone:      " << std::left << setw(20) << zone_params->get_name() << " (" << zone_params->get_id() << ")" << dendl;
+  ldpp_dout(dpp, 0) << "Realm:     " << std::left << setw(20) << realm->get_name() << " (" << realm->get_id() << ")" << dendl;
+  ldpp_dout(dpp, 0) << "ZoneGroup: " << std::left << setw(20) << zonegroup->get_name() << " (" << zonegroup->get_id() << ")" << dendl;
+  ldpp_dout(dpp, 0) << "Zone:      " << std::left << setw(20) << zone_params->get_name() << " (" << zone_params->get_id() << ")" << dendl;
 
   if (init_from_period) {
-    ldpp_dout(dpp, 4) << "using period configuration: " << current_period->get_id() << ":" << current_period->get_epoch() << dendl;
+    ldpp_dout(dpp, 0) << "using period configuration: " << current_period->get_id() << ":" << current_period->get_epoch() << dendl;
     ret = init_zg_from_period(dpp, y);
     if (ret < 0) {
       return ret;
     }
   } else {
-    ldout(cct, 10) << "cannot find current period zonegroup using local zonegroup configuration" << dendl;
+    ldout(cct, 0) << "cannot find current period zonegroup using local zonegroup configuration" << dendl;
     ret = init_zg_from_local(dpp, y);
     if (ret < 0) {
       return ret;
@@ -296,6 +302,12 @@ int RGWSI_Zone::do_start(optional_yield y, const DoutPrefixProvider *dpp)
       return ret;
     }
   }
+
+  ldout(cct, 0) << __func__ << " gc pool: " << zone_params->gc_pool.name << dendl;
+  ldout(cct, 0) << __func__ << " lc pool: " << zone_params->lc_pool.name << dendl;
+  ldout(cct, 0) << __func__ << " log pool: " << zone_params->log_pool.name << dendl;
+  ldout(cct, 0) << __func__ << " domain_root: " << zone_params->domain_root.name << dendl;
+  ldout(cct, 0) << __func__ << " dedup_chunk pool: " << zone_params->dedup_chunk_pool.name << dendl;
 
   zone_short_id = current_period->get_map().get_zone_short_id(zone_params->get_id());
 
@@ -376,7 +388,7 @@ int RGWSI_Zone::do_start(optional_yield y, const DoutPrefixProvider *dpp)
     }
   }
 
-  ldpp_dout(dpp, 20) << "started zone id=" << zone_params->get_id() << " (name=" << zone_params->get_name() << 
+  ldpp_dout(dpp, 0) << "started zone id=" << zone_params->get_id() << " (name=" << zone_params->get_name() << 
         ") with tier type = " << zone_public_config->tier_type << dendl;
 
   return 0;
@@ -599,6 +611,7 @@ int RGWSI_Zone::replace_region_with_zonegroup(const DoutPrefixProvider *dpp, opt
     }
   }
 
+  ldout(cct, 0) << __func__ << "create zonegroups" << dendl;
   list<string>::iterator iter;
   /* create zonegroups */
   for (iter = regions.begin(); iter != regions.end(); ++iter)
@@ -724,6 +737,8 @@ int RGWSI_Zone::replace_region_with_zonegroup(const DoutPrefixProvider *dpp, opt
     return ret;
   }
 
+  ldout(cct, 0) << __func__ << " done" << dendl;
+
   return 0;
 }
 
@@ -835,7 +850,7 @@ int RGWSI_Zone::create_default_zg(const DoutPrefixProvider *dpp, optional_yield 
 
 int RGWSI_Zone::init_default_zone(const DoutPrefixProvider *dpp, optional_yield y)
 {
-  ldpp_dout(dpp, 10) << " Using default name "<< default_zone_name << dendl;
+  ldpp_dout(dpp, 0) << " Using default name "<< default_zone_name << dendl;
   zone_params->set_name(default_zone_name);
   int ret = zone_params->init(dpp, cct, sysobj_svc, y);
   if (ret < 0 && ret != -ENOENT) {
@@ -848,7 +863,7 @@ int RGWSI_Zone::init_default_zone(const DoutPrefixProvider *dpp, optional_yield 
 
 int RGWSI_Zone::init_zg_from_local(const DoutPrefixProvider *dpp, optional_yield y)
 {
-  ldpp_dout(dpp, 20) << "zonegroup " << zonegroup->get_name() << dendl;
+  ldpp_dout(dpp, 0) << "zonegroup " << zonegroup->get_name() << dendl;
   if (zonegroup->is_master_zonegroup()) {
     // use endpoints from the zonegroup's master zone
     auto master = zonegroup->zones.find(zonegroup->master_zone);
