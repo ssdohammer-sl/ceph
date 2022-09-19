@@ -1,7 +1,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
-#include "rgw_dedup.h"
+#include <sstream>
 
 #include "rgw_tools.h"
 #include "include/scope_guard.h"
@@ -12,7 +12,7 @@
 #include "rgw_perf_counters.h"
 #include "cls/lock/cls_lock_client.h"
 
-#include <sstream>
+#include "rgw_dedup.h"
 
 //#define dout_context g_ceph_context
 //#define dout_subsys ceph_subsys_rgw
@@ -42,23 +42,25 @@ int RGWDedup::process()
   // object operation
   // set chunk, tier flush, tier evict
   //
+
+  int ret = 0;
+  return ret;
 }
 
 bool RGWDedup::going_down()
 {
-
+  return true;  // TODO
 }
 
 // create DedupWorker threads
 void RGWDedup::start_processor()
 {
   for (auto i = 0; i < num_workers; i++) {
-    ldpp_dout(this, 5) << "RGWDedup::start_processor creating dedup_worker " << i << dendl;
-//    unique_ptr<Thread> worker_ptr (new DedupWorker());
-//    worker_ptr->create("dedup_worker_" + i);
-//    worker_threads.push_back(move(worker_ptr));
+    ldout(cct, 0) << __func__ << " RGWDedup::start_processor creating dedup_worker " << i << dendl;
+    unique_ptr<DedupWorker> worker_ptr (new DedupWorker(this, cct, this, i));
+    worker_ptr->create("dedup_worker_" + i);
+    worker_threads.push_back(move(worker_ptr));
   }
-  cout << num_workers << " threads are created" << endl;
 }
 
 void RGWDedup::stop_processor()
@@ -86,7 +88,7 @@ RGWDedup::~RGWDedup()
 // what dedup worker actually do
 void *RGWDedup::DedupWorker::entry()
 {
-  ldpp_dout(this, 5) << "DedupWorker_" << id << " started" << dendl;
+  ldout(cct, 0) << __func__ << " DedupWorker_" << id << " started" << dendl;
 
   return nullptr;
 }

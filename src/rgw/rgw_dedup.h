@@ -52,8 +52,8 @@ class RGWDedup : public DoutPrefixProvider {
   };
 
   std::atomic<bool> down_flag = { false };
+  int num_workers = NUM_DEFAULT_WORKERS;
   /*
-  uint32_t num_workers = NUM_DEFAULT_WORKERS;
   uint32_t dedup_period;
   double sampling_ratio;
   uint32_t chunk_size;
@@ -63,9 +63,7 @@ class RGWDedup : public DoutPrefixProvider {
   vector<std::unique_ptr<RGWDedup::DedupWorker>> worker_threads;
 
 public:
-  RGWDedup() : cct(nullptr), store(nullptr) {
-  
-  }
+  RGWDedup() : cct(nullptr), store(nullptr) {}
 //  ~RGWDedup() override;
 //  ~RGWDedup();
 
