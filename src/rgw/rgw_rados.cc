@@ -1249,11 +1249,11 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
     << " and init RGWDedup" << dendl;
   if (use_dedup_threads) {
     dedup = new RGWDedup();
-    dedup->initialize(cct, this->store);
+    dedup->initialize(cct, this);
     dedup->start_processor();
     ldpp_dout(dpp, 0) << "RGWDedup initialized and started" << dendl;
   } else {
-    ldpp_dout(dpp, 5) << "note: Dedup not initialized" << dendl;
+    ldpp_dout(dpp, 0) << "note: Dedup not initialized" << dendl;
   }
 
   auto& current_period = svc.zone->get_current_period();

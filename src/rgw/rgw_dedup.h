@@ -26,21 +26,22 @@ using namespace std;
 const int NUM_DEFAULT_WORKERS = 2;
 
 class RGWDedup : public DoutPrefixProvider {
-  CephContext *cct;
-//  RGWRados *store;
-  rgw::sal::Store* store;
+  CephContext* cct;
+  RGWRados* store;
+  RGWSI_Bucket* bucket_svc;
+//  rgw::sal::Store* store;
 
   class DedupWorker : public Thread {
-    const DoutPrefixProvider *dpp;
-    CephContext *cct;
-    RGWDedup *dedup;
+    const DoutPrefixProvider* dpp;
+    CephContext* cct;
+    RGWDedup* dedup;
     ceph::mutex lock = ceph::make_mutex("DedupWorker");
     ceph::condition_variable cond;
     uint32_t id;
     bool run_dedup;
 
   public:
-    DedupWorker(const DoutPrefixProvider *_dpp, CephContext *_cct, RGWDedup *_dedup, uint32_t _id)
+    DedupWorker(const DoutPrefixProvider* _dpp, CephContext* _cct, RGWDedup* _dedup, uint32_t _id)
       : dpp(_dpp), cct(_cct), dedup(_dedup), id(_id) {}
     ~DedupWorker() {
       std::cout << "DedupWorker_" << id << " destructed" << std::endl;
@@ -67,11 +68,7 @@ public:
 //  ~RGWDedup() override;
 //  ~RGWDedup();
 
-  void initialize(CephContext* _cct, rgw::sal::Store* _store) {
-    cct = _cct;
-    store = _store;
-    ldout(cct, 0) << __func__ << " initialize RGWDedup done" << dendl;
-  }
+  void initialize(CephContext* _cct, RGWRados* _store);
   void finalize();
   int process();
 
