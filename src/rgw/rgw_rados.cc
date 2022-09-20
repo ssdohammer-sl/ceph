@@ -1218,7 +1218,6 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
   ret = open_notif_pool_ctx(dpp);
   if (ret < 0)
     return ret;
-  ldpp_dout(dpp, 0) << "start to open dedup chunk pool" << dendl;
 
 /*  TODO need to create chunk pool
   ret = open_dedup_chunk_pool_ctx(dpp);
@@ -1418,14 +1417,12 @@ int RGWRados::init_begin(const DoutPrefixProvider *dpp)
     ldpp_dout(dpp, 0) << "ERROR: failed to init services (ret=" << cpp_strerror(-ret) << ")" << dendl;
     return ret;
   }
-  ldout(cct, 0) << __func__ << " init services done" << dendl;
 
   ret = init_ctl(dpp);
   if (ret < 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to init ctls (ret=" << cpp_strerror(-ret) << ")" << dendl;
     return ret;
   }
-  ldout(cct, 0) << __func__ << " init ctls done" << dendl;
 
   host_id = svc.zone_utils->gen_host_id();
 

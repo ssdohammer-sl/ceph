@@ -23,37 +23,56 @@
 
 using namespace std;
 
-const int NUM_DEFAULT_WORKERS = 2;
+const int DEFAULT_NUM_WORKERS = 2;
+const int DEFAULT_DEDUP_PERIOD = 10;
 
 class RGWDedup : public DoutPrefixProvider {
   CephContext* cct;
   RGWRados* store;
   RGWSI_Bucket* bucket_svc;
 //  rgw::sal::Store* store;
+  std::atomic<bool> run_dedup = { true };
+
+  class DedupProcessor : public Thread {
+    const DoutPrefixProvider* dpp;
+    CephContext* cct;
+    rgw::sal::Store* store;
+
+    RGWDedup* dedup;
+    std::atomic<bool> down_flag = { false };
+    int num_workers = DEFAULT_NUM_WORKERS;
+    int dedup_period = DEFAULT_DEDUP_PERIOD;
+
+  public:
+    DedupProcessor(const DoutPrefixProvider* _dpp, CephContext* _cct, RGWDedup* _dedup)
+      : dpp(_dpp), cct(_cct), dedup(_dedup), id(_id) {}
+    ~DedupProcessor() { }
+    void* entry() override;
+    void stop();
+
+    friend class RGWDedup;
+  }
+
 
   class DedupWorker : public Thread {
     const DoutPrefixProvider* dpp;
     CephContext* cct;
-    RGWDedup* dedup;
     ceph::mutex lock = ceph::make_mutex("DedupWorker");
     ceph::condition_variable cond;
     uint32_t id;
-    bool run_dedup;
 
   public:
-    DedupWorker(const DoutPrefixProvider* _dpp, CephContext* _cct, RGWDedup* _dedup, uint32_t _id)
-      : dpp(_dpp), cct(_cct), dedup(_dedup), id(_id) {}
+    DedupWorker(const DoutPrefixProvider* _dpp, CephContext* _cct, uint32_t _id)
+      : dpp(_dpp), cct(_cct), id(_id) {}
     ~DedupWorker() {
-      std::cout << "DedupWorker_" << id << " destructed" << std::endl;
+      ldout(cct, 0) << "DedupWorker_" << id << " destructed" << dendl;
     }
     void *entry() override;
     void stop();
 
-    friend class RGWDedup;
+    friend class DedupDaemon;
   };
 
-  std::atomic<bool> down_flag = { false };
-  int num_workers = NUM_DEFAULT_WORKERS;
   /*
   uint32_t dedup_period;
   double sampling_ratio;
@@ -61,7 +80,8 @@ class RGWDedup : public DoutPrefixProvider {
   uint32_t chunk_dedup_threshold;
   string fp_algo;
   */
-  vector<std::unique_ptr<RGWDedup::DedupWorker>> worker_threads;
+  list<unique_ptr<RGWDedup::DedupWorker>> workers;
+  unique_ptr<DedupProcessor> proc;
 
 public:
   RGWDedup() : cct(nullptr), store(nullptr) {}
@@ -69,6 +89,7 @@ public:
 //  ~RGWDedup();
 
   void initialize(CephContext* _cct, RGWRados* _store);
+//  void initialize(CephContext* _cct, rgw::sal::Store* _store);
   void finalize();
   int process();
 
