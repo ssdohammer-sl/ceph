@@ -28,11 +28,6 @@ void RGWDedup::initialize(CephContext* _cct, RGWRados* _store)
 {
   cct = _cct;
   store = _store;
-  bucket_svc = store->svc.bucket;
-
-  // get user info
-  void* handle;
-  int ret = store->meta_list_keys_init(dpp, "user", marker, &handle);
 }
 
 void RGWDedup::finalize()
@@ -69,31 +64,8 @@ void RGWDedup::start_processor()
   */
 
   // starts DedupProcessor
-  proc.reset(new DedupProcessor(this, cct, this));
+  proc.reset(new DedupProcessor(this, cct, this, store));
   proc->create("dedup_proc");
-}
-
-void* RGWDedup::DedupProcessor::entry()
-{
-  // while (run_dedup)
-  if (run_dedup)
-  {
-    for (auto i = 0; i < num_workers; i++)
-    {
-      unique_ptr<DedupWorker> ptr(new DedupWorker(dpp, cct, i));
-      ptr->create("dedup_worker_" + i);
-      workers.emplace_back(move(ptr));
-    }
-
-    for (auto& w: workers)
-    {
-      w->join();
-    }
-
-    sleep(dedup_period);
-  }
-
-  ldout(cct, 0) << __func__ << " RGWDedup loop done" << dendl;
 }
 
 void RGWDedup::stop_processor()
@@ -116,6 +88,37 @@ RGWDedup::~RGWDedup()
   finalize();
 }
 */
+
+void RGWDedup::DedupProcessor::get_users()
+{
+  // get user info
+  void* handle;
+  int ret = store->store.meta_list_keys_init(dpp, "user", marker, &handle);
+}
+
+void* RGWDedup::DedupProcessor::entry()
+{
+  // while (down_flag)
+  if (!down_flag)
+  {
+    for (auto i = 0; i < num_workers; i++)
+    {
+      unique_ptr<DedupWorker> ptr(new DedupWorker(dpp, cct, i));
+      ptr->create("dedup_worker_" + i);
+      workers.emplace_back(move(ptr));
+    }
+
+    for (auto& w: workers)
+    {
+      w->join();
+    }
+
+    sleep(dedup_period);
+  } // done while
+
+  ldout(cct, 0) << __func__ << " RGWDedup loop done" << dendl;
+  return nullptr;
+}
 
 
 // what dedup worker actually do

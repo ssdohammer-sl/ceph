@@ -29,30 +29,8 @@ const int DEFAULT_DEDUP_PERIOD = 10;
 class RGWDedup : public DoutPrefixProvider {
   CephContext* cct;
   RGWRados* store;
-  RGWSI_Bucket* bucket_svc;
 //  rgw::sal::Store* store;
-  std::atomic<bool> run_dedup = { true };
-
-  class DedupProcessor : public Thread {
-    const DoutPrefixProvider* dpp;
-    CephContext* cct;
-    rgw::sal::Store* store;
-
-    RGWDedup* dedup;
-    std::atomic<bool> down_flag = { false };
-    int num_workers = DEFAULT_NUM_WORKERS;
-    int dedup_period = DEFAULT_DEDUP_PERIOD;
-
-  public:
-    DedupProcessor(const DoutPrefixProvider* _dpp, CephContext* _cct, RGWDedup* _dedup)
-      : dpp(_dpp), cct(_cct), dedup(_dedup), id(_id) {}
-    ~DedupProcessor() { }
-    void* entry() override;
-    void stop();
-
-    friend class RGWDedup;
-  }
-
+  std::atomic<bool> run_dedup = { true };   // TODO: need to be false. use config
 
   class DedupWorker : public Thread {
     const DoutPrefixProvider* dpp;
@@ -60,6 +38,8 @@ class RGWDedup : public DoutPrefixProvider {
     ceph::mutex lock = ceph::make_mutex("DedupWorker");
     ceph::condition_variable cond;
     uint32_t id;
+
+    RGWRados* store;
 
   public:
     DedupWorker(const DoutPrefixProvider* _dpp, CephContext* _cct, uint32_t _id)
@@ -73,20 +53,41 @@ class RGWDedup : public DoutPrefixProvider {
     friend class DedupDaemon;
   };
 
-  /*
-  uint32_t dedup_period;
-  double sampling_ratio;
-  uint32_t chunk_size;
-  uint32_t chunk_dedup_threshold;
-  string fp_algo;
-  */
-  list<unique_ptr<RGWDedup::DedupWorker>> workers;
+  class DedupProcessor : public Thread {
+    const DoutPrefixProvider* dpp;
+    CephContext* cct;
+    RGWDedup* dedup;
+    RGWRados* store;
+
+    std::atomic<bool> down_flag = { false };
+    int num_workers = DEFAULT_NUM_WORKERS;
+    int dedup_period = DEFAULT_DEDUP_PERIOD;
+    list<unique_ptr<RGWDedup::DedupWorker>> workers;
+    /*
+    uint32_t dedup_period;
+    double sampling_ratio;
+    uint32_t chunk_size;
+    uint32_t chunk_dedup_threshold;
+    string fp_algo;
+    */
+
+  public:
+    DedupProcessor(const DoutPrefixProvider* _dpp, CephContext* _cct, RGWDedup* _dedup,
+                   RGWRados* _store)
+      : dpp(_dpp), cct(_cct), dedup(_dedup), store(_store) {}
+    ~DedupProcessor() {}
+    void* entry() override;
+    void stop();
+
+    void get_users();
+
+    friend class RGWDedup;
+  };
   unique_ptr<DedupProcessor> proc;
 
 public:
   RGWDedup() : cct(nullptr), store(nullptr) {}
-//  ~RGWDedup() override;
-//  ~RGWDedup();
+  ~RGWDedup() override {}
 
   void initialize(CephContext* _cct, RGWRados* _store);
 //  void initialize(CephContext* _cct, rgw::sal::Store* _store);
