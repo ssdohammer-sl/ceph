@@ -24,7 +24,7 @@ static string dedup_oid_prefix = "dedup";
 static string dedup_index_lock_name = "dedup_process";
 
 // init member variables
-void RGWDedup::initialize(CephContext* _cct, RGWRados* _store)
+void RGWDedup::initialize(CephContext* _cct, rgw::sal::Store* _store)
 {
   cct = _cct;
   store = _store;
@@ -93,7 +93,9 @@ void RGWDedup::DedupProcessor::get_users()
 {
   // get user info
   void* handle;
-  int ret = store->store.meta_list_keys_init(dpp, "user", marker, &handle);
+  string marker;
+  //rgw::sal::RadosStore* rados_store = store->store
+  int ret = store->meta_list_keys_init(dpp, "user", marker, &handle);
 }
 
 void* RGWDedup::DedupProcessor::entry()

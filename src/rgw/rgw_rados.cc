@@ -1248,7 +1248,7 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
     << " and init RGWDedup" << dendl;
   if (use_dedup_threads) {
     dedup = new RGWDedup();
-    dedup->initialize(cct, this);
+    dedup->initialize(cct, this->store);
     dedup->start_processor();
     ldpp_dout(dpp, 0) << "RGWDedup initialized and started" << dendl;
   } else {

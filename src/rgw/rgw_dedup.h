@@ -28,8 +28,8 @@ const int DEFAULT_DEDUP_PERIOD = 10;
 
 class RGWDedup : public DoutPrefixProvider {
   CephContext* cct;
-  RGWRados* store;
-//  rgw::sal::Store* store;
+//  RGWRados* store;
+  rgw::sal::Store* store;
   std::atomic<bool> run_dedup = { true };   // TODO: need to be false. use config
 
   class DedupWorker : public Thread {
@@ -39,7 +39,8 @@ class RGWDedup : public DoutPrefixProvider {
     ceph::condition_variable cond;
     uint32_t id;
 
-    RGWRados* store;
+//    RGWRados* store;
+    rgw::sal::Store* store;
 
   public:
     DedupWorker(const DoutPrefixProvider* _dpp, CephContext* _cct, uint32_t _id)
@@ -57,7 +58,8 @@ class RGWDedup : public DoutPrefixProvider {
     const DoutPrefixProvider* dpp;
     CephContext* cct;
     RGWDedup* dedup;
-    RGWRados* store;
+    //RGWRados* store;
+    rgw::sal::Store* store;
 
     std::atomic<bool> down_flag = { false };
     int num_workers = DEFAULT_NUM_WORKERS;
@@ -73,7 +75,7 @@ class RGWDedup : public DoutPrefixProvider {
 
   public:
     DedupProcessor(const DoutPrefixProvider* _dpp, CephContext* _cct, RGWDedup* _dedup,
-                   RGWRados* _store)
+                   rgw::sal::Store* _store)
       : dpp(_dpp), cct(_cct), dedup(_dedup), store(_store) {}
     ~DedupProcessor() {}
     void* entry() override;
@@ -89,8 +91,8 @@ public:
   RGWDedup() : cct(nullptr), store(nullptr) {}
   ~RGWDedup() override {}
 
-  void initialize(CephContext* _cct, RGWRados* _store);
-//  void initialize(CephContext* _cct, rgw::sal::Store* _store);
+  //void initialize(CephContext* _cct, RGWRados* _store);
+  void initialize(CephContext* _cct, rgw::sal::Store* _store);
   void finalize();
   int process();
 
