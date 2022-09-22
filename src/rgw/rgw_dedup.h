@@ -81,7 +81,7 @@ class RGWDedup : public DoutPrefixProvider {
     void* entry() override;
     void stop();
 
-    void get_users();
+    int get_users();
 
     friend class RGWDedup;
   };

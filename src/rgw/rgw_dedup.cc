@@ -89,13 +89,44 @@ RGWDedup::~RGWDedup()
 }
 */
 
-void RGWDedup::DedupProcessor::get_users()
+int RGWDedup::DedupProcessor::get_users()
 {
   // get user info
   void* handle;
   string marker;
   //rgw::sal::RadosStore* rados_store = store->store
   int ret = store->meta_list_keys_init(dpp, "user", marker, &handle);
+  if (ret < 0) {
+    cerr << "ERROR: can't get key: " << cpp_strerror(-ret) << std::endl;
+    return -ret;
+  }
+
+  bool truncated;
+  uint64_t count = 0;
+  uint64_t left;
+  list<string> keys;
+  ret = store->meta_list_keys_next(dpp, handle, 10, keys, &truncated);
+  if (ret != -ENOENT) {
+    for (list<string>::iterator iter = keys.begin(); iter != keys.end(); ++iter) {
+      ldout(cct, 0) << "  " << *iter << dendl;
+      ++count;
+    }
+  }
+  /*
+  do {
+    list<string> keys;
+    left = (max_entries_specified ? max_entries - count : max);
+    ret = store->meta_list_keys_next(dpp, handle, left, keys, &truncated);
+    if (ret < 0) {
+      cerr << "ERROR: lists_keys_next(): " << cpp_strerror(-ret) << std::endl;
+      return -ret;
+    }
+  } while (truncated && left > 0);
+  */
+
+  store->meta_list_keys_complete(handle);
+
+  ldout(cct, 0) << __func__ << " get users done. truncated: " << truncated << dendl;
 }
 
 void* RGWDedup::DedupProcessor::entry()
@@ -103,6 +134,7 @@ void* RGWDedup::DedupProcessor::entry()
   // while (down_flag)
   if (!down_flag)
   {
+    get_users();
     for (auto i = 0; i < num_workers; i++)
     {
       unique_ptr<DedupWorker> ptr(new DedupWorker(dpp, cct, i));
