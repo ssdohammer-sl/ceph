@@ -72,6 +72,8 @@ class RGWDedup : public DoutPrefixProvider {
     uint32_t chunk_dedup_threshold;
     string fp_algo;
     */
+    list<string> users;
+    list<stirng> buckets;
 
   public:
     DedupProcessor(const DoutPrefixProvider* _dpp, CephContext* _cct, RGWDedup* _dedup,
