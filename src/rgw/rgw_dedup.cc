@@ -66,6 +66,7 @@ void RGWDedup::start_processor()
   // starts DedupProcessor
   proc.reset(new DedupProcessor(this, cct, this, store));
   proc->create("dedup_proc");
+  ldout(cct, 0) << __func__ << " start DedupProcessor done" << dendl;
 }
 
 void RGWDedup::stop_processor()
@@ -94,7 +95,6 @@ int RGWDedup::DedupProcessor::get_users()
   // get user list
   void* handle;
   string marker;
-  //rgw::sal::RadosStore* rados_store = store->store
   int ret = store->meta_list_keys_init(dpp, "user", marker, &handle);
   if (ret < 0) {
     cerr << "ERROR: can't get key: " << cpp_strerror(-ret) << std::endl;
@@ -102,19 +102,20 @@ int RGWDedup::DedupProcessor::get_users()
   }
 
   bool truncated;
-  uint64_t count = 0;
-  list<string> keys;
-  ret = store->meta_list_keys_next(dpp, handle, 10, keys, &truncated);
+  list<string> user_list;
+  ret = store->meta_list_keys_next(dpp, handle, 10, user_list, &truncated);
   ldout(cct, 0) << __func__ << " ret: " << ret << ", truncated: " << truncated
-    << ", keys len: " << keys.size() << dendl;
+    << ", users len: " << user_list.size() << dendl;
   if (ret != -ENOENT) {
-    if (keys.size() <= 0) {
+    if (user_list.size() == 0) {
        ldout(cct, 0) << __func__ << " no user exists" << dendl;
        return -1;
     }
-    for (list<string>::iterator iter = keys.begin(); iter != keys.end(); ++iter) {
+    for (list<string>::iterator iter = user_list.begin(); 
+	 iter != user_list.end(); 
+	 ++iter) {
       ldout(cct, 0) << "  " << *iter << dendl;
-      ++count;
+      users.emplace_back(*iter);
     }
   }
   store->meta_list_keys_complete(handle);
@@ -125,16 +126,75 @@ int RGWDedup::DedupProcessor::get_users()
 int RGWDedup::DedupProcessor::get_buckets()
 {
   // get bucket list
+  void* handle;
+  int ret = store->meta_list_keys_init(dpp, "bucket", string(), &handle);
+  if (ret < 0) {
+    cerr << "ERROR: can't get key: " << cpp_strerror(-ret) << std::endl;
+    return -ret;
+  }
+  
+  string bucket_name;
+  bool truncated = true;
+  list<string> bucket_list;
+  ret = store->meta_list_keys_next(dpp, handle, 10, bucket_list, &truncated);
+  if (ret != -ENOENT) {
+    if (bucket_list.size() == 0) {
+      ldout(cct, 0) << __func__ << " no bucket exists" << dendl;
+      return -1;
+    }
+    for (list<string>::iterator iter = bucket_list.begin();
+	 iter != bucket_list.end();
+	 ++iter) {
+      ldout(cct, 0) << "  " << *iter << dendl;
+      buckets.emplace_back(*iter);
+    }
+  }
+  ldout(cct, 0) << __func__ << " keys len: " << buckets.size() << dendl;
+  store->meta_list_keys_complete(handle);
 
+  return 0;
+}
+
+int RGWDedup::DedupProcessor::get_objects()
+{
+  // get all the objects from selected buckets
+  if (buckets.empty()) {
+    ldout(cct, 0) << __func__ << " no selected buckets" << dendl;
+    return -1;
+  }
+
+  for (auto bucket_name : buckets) {
+    // get bucket owner from stats
+    unique_ptr<rgw::sal::Bucket> bucket;
+    rgw_bucket b{string(), bucket_name, string()};
+    int ret = store->get_bucket(dpp, nullptr, b, &bucket, null_yield);
+    if (ret < 0) {
+      cerr << "ERROR: could not init bucket:" <<cpp_strerror(-ret) << std::endl;
+      return -ret;
+    }
+
+    rgw::sal::Bucket::ListParams params;
+    rgw::sal::Bucket::ListResults results;
+    ret = bucket->list(dpp, params, 100, results, null_yield);
+    if (ret < 0) {
+      cerr << "ERROR: store->list_objects(): " << cpp_strerror(-ret) << std::endl;
+      return -ret;
+    }
+
+    ldout(cct, 0) << __func__ << " num objects: " << results.objs.size() << dendl;
+  }
+ 
   return 0;
 }
 
 void* RGWDedup::DedupProcessor::entry()
 {
-  // while (down_flag)
+  //while (down_flag)
   if (!down_flag)
   {
-    get_users();
+    //get_users();
+    get_buckets();
+    get_objects();
     for (auto i = 0; i < num_workers; i++)
     {
       unique_ptr<DedupWorker> ptr(new DedupWorker(dpp, cct, i));
@@ -150,7 +210,6 @@ void* RGWDedup::DedupProcessor::entry()
     sleep(dedup_period);
   } // done while
 
-  ldout(cct, 0) << __func__ << " RGWDedup loop done" << dendl;
   return nullptr;
 }
 

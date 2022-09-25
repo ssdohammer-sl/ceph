@@ -103,7 +103,6 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
       ldout(cct, 0) << "create RadosStore done" << dendl;
       ldout(cct, 0) << "run_dedup_threads: " << use_dedup_threads << dendl;
     }
-    use_dedup_threads = true;
 
     if ((*rados).set_use_cache(use_cache)
                 .set_use_datacache(false)

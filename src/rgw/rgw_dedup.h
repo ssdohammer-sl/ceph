@@ -24,7 +24,7 @@
 using namespace std;
 
 const int DEFAULT_NUM_WORKERS = 2;
-const int DEFAULT_DEDUP_PERIOD = 10;
+const int DEFAULT_DEDUP_PERIOD = 3;
 
 class RGWDedup : public DoutPrefixProvider {
   CephContext* cct;
@@ -73,7 +73,8 @@ class RGWDedup : public DoutPrefixProvider {
     string fp_algo;
     */
     list<string> users;
-    list<stirng> buckets;
+    list<string> buckets;
+    list<string> objects;
 
   public:
     DedupProcessor(const DoutPrefixProvider* _dpp, CephContext* _cct, RGWDedup* _dedup,
@@ -84,6 +85,8 @@ class RGWDedup : public DoutPrefixProvider {
     void stop();
 
     int get_users();
+    int get_buckets();
+    int get_objects();
 
     friend class RGWDedup;
   };

@@ -368,7 +368,8 @@ int main(int argc, const char **argv)
 				 g_conf()->rgw_enable_quota_threads,
 				 g_conf()->rgw_run_sync_thread,
 				 g_conf().get_val<bool>("rgw_dynamic_resharding"),
-                                 g_conf()->rgw_enable_dedup_threads,
+                                 //g_conf()->rgw_enable_dedup_threads,
+				 true,		// rgw_enable_dedup_threads
 				 g_conf()->rgw_cache_enabled);
   if (!store) {
     mutex.lock();

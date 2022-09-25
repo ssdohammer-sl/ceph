@@ -1243,7 +1243,6 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
     obj_expirer->start_processor();
   }
 
-  use_dedup_threads = true;
   ldout(cct, 0) << __func__ << " use_dedup_threads: " << use_dedup_threads 
     << " and init RGWDedup" << dendl;
   if (use_dedup_threads) {
