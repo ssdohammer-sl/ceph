@@ -173,15 +173,21 @@ int RGWDedup::DedupProcessor::get_objects()
       return -ret;
     }
 
+    bool is_truncated = true;
     rgw::sal::Bucket::ListParams params;
     rgw::sal::Bucket::ListResults results;
-    ret = bucket->list(dpp, params, 100, results, null_yield);
-    if (ret < 0) {
-      cerr << "ERROR: store->list_objects(): " << cpp_strerror(-ret) << std::endl;
-      return -ret;
+    while (is_truncated) {
+      ret = bucket->list(dpp, params, MAX_OBJ_WINDOW_SIZE, results, null_yield);
+      if (ret < 0) {
+        cerr << "ERROR: store->list_objects(): " << cpp_strerror(-ret) << std::endl;
+        return -ret;
+      }
+      for (auto obj : results.objs) {
+        objects.emplace_back(obj);
+        ldout(cct, 0) << "  index_ver: " << obj.index_ver << "  versioned_epoch: " << obj.versioned_epoch << dendl;
+      }
+      is_truncated = results.is_truncated;
     }
-
-    ldout(cct, 0) << __func__ << " num objects: " << results.objs.size() << dendl;
   }
  
   return 0;
@@ -195,6 +201,8 @@ void* RGWDedup::DedupProcessor::entry()
     //get_users();
     get_buckets();
     get_objects();
+    ldout(cct, 0) << __func__ << " " << buckets.size() << " buckets, " << objects.size()
+      << " objects found" << dendl;
     for (auto i = 0; i < num_workers; i++)
     {
       unique_ptr<DedupWorker> ptr(new DedupWorker(dpp, cct, i));

@@ -25,10 +25,10 @@ using namespace std;
 
 const int DEFAULT_NUM_WORKERS = 2;
 const int DEFAULT_DEDUP_PERIOD = 3;
+const int MAX_OBJ_WINDOW_SIZE = 100;
 
 class RGWDedup : public DoutPrefixProvider {
   CephContext* cct;
-//  RGWRados* store;
   rgw::sal::Store* store;
   std::atomic<bool> run_dedup = { true };   // TODO: need to be false. use config
 
@@ -39,7 +39,6 @@ class RGWDedup : public DoutPrefixProvider {
     ceph::condition_variable cond;
     uint32_t id;
 
-//    RGWRados* store;
     rgw::sal::Store* store;
 
   public:
@@ -74,7 +73,7 @@ class RGWDedup : public DoutPrefixProvider {
     */
     list<string> users;
     list<string> buckets;
-    list<string> objects;
+    list<rgw_bucket_dir_entry> objects;
 
   public:
     DedupProcessor(const DoutPrefixProvider* _dpp, CephContext* _cct, RGWDedup* _dedup,
