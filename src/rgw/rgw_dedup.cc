@@ -54,15 +54,6 @@ bool RGWDedup::going_down()
 // create DedupWorker threads
 void RGWDedup::start_processor()
 {
-  /*
-  for (auto i = 0; i < num_workers; i++) {
-    ldout(cct, 0) << __func__ << " RGWDedup::start_processor creating dedup_worker " << i << dendl;
-    unique_ptr<DedupWorker> worker_ptr (new DedupWorker(this, cct, this, i));
-    worker_ptr->create("dedup_worker_" + i);
-    worker_threads.push_back(move(worker_ptr));
-  }
-  */
-
   // starts DedupProcessor
   proc.reset(new DedupProcessor(this, cct, this, store));
   proc->create("dedup_proc");
@@ -71,16 +62,13 @@ void RGWDedup::start_processor()
 
 void RGWDedup::stop_processor()
 {
-/*  down_flag = true;
-  if (worker_threads.size() > 0) {
-    for (auto i = 0; i < worker_threads.size(); i++) {
-      if (worker_threads[i].get()) {
-        worker_threads[i]->stop();
-        worker_threads[i]->join();
-      }
-      worker_thread[i].reset();
-    }
-  }*/
+  run_dedup = true;
+  if (proc.get()) {
+    proc->stop();
+    proc->join();
+  }
+  delete proc;
+  proc = nullptr;
 }
 /*
 RGWDedup::~RGWDedup()
@@ -104,8 +92,6 @@ int RGWDedup::DedupProcessor::get_users()
   bool truncated;
   list<string> user_list;
   ret = store->meta_list_keys_next(dpp, handle, 10, user_list, &truncated);
-  ldout(cct, 0) << __func__ << " ret: " << ret << ", truncated: " << truncated
-    << ", users len: " << user_list.size() << dendl;
   if (ret != -ENOENT) {
     if (user_list.size() == 0) {
        ldout(cct, 0) << __func__ << " no user exists" << dendl;
@@ -114,7 +100,6 @@ int RGWDedup::DedupProcessor::get_users()
     for (list<string>::iterator iter = user_list.begin(); 
 	 iter != user_list.end(); 
 	 ++iter) {
-      ldout(cct, 0) << "  " << *iter << dendl;
       users.emplace_back(*iter);
     }
   }
@@ -136,7 +121,7 @@ int RGWDedup::DedupProcessor::get_buckets()
   string bucket_name;
   bool truncated = true;
   list<string> bucket_list;
-  ret = store->meta_list_keys_next(dpp, handle, 10, bucket_list, &truncated);
+  ret = store->meta_list_keys_next(dpp, handle, MAX_BUCKET_WINDOW_SIZE, bucket_list, &truncated);
   if (ret != -ENOENT) {
     if (bucket_list.size() == 0) {
       ldout(cct, 0) << __func__ << " no bucket exists" << dendl;
@@ -145,11 +130,9 @@ int RGWDedup::DedupProcessor::get_buckets()
     for (list<string>::iterator iter = bucket_list.begin();
 	 iter != bucket_list.end();
 	 ++iter) {
-      ldout(cct, 0) << "  " << *iter << dendl;
       buckets.emplace_back(*iter);
     }
   }
-  ldout(cct, 0) << __func__ << " keys len: " << buckets.size() << dendl;
   store->meta_list_keys_complete(handle);
 
   return 0;
@@ -184,7 +167,7 @@ int RGWDedup::DedupProcessor::get_objects()
       }
       for (auto obj : results.objs) {
         objects.emplace_back(obj);
-        ldout(cct, 0) << "  index_ver: " << obj.index_ver << "  versioned_epoch: " << obj.versioned_epoch << dendl;
+        //ldout(cct, 0) << "  " << obj.key.name << "  index_ver: " << obj.index_ver << "  versioned_epoch: " << obj.versioned_epoch << "  pool: " << obj.ver.pool << "  epoch: " << obj.ver.epoch << dendl;
       }
       is_truncated = results.is_truncated;
     }
@@ -195,8 +178,7 @@ int RGWDedup::DedupProcessor::get_objects()
 
 void* RGWDedup::DedupProcessor::entry()
 {
-  //while (down_flag)
-  if (!down_flag)
+  while (!down_flag)
   {
     //get_users();
     get_buckets();
@@ -219,6 +201,12 @@ void* RGWDedup::DedupProcessor::entry()
   } // done while
 
   return nullptr;
+}
+
+void RGWDedup::DedupProcessor::stop()
+{
+  std::lock_guard l{lock};
+  cond.notify_all();
 }
 
 

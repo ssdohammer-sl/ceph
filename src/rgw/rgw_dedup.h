@@ -26,6 +26,7 @@ using namespace std;
 const int DEFAULT_NUM_WORKERS = 2;
 const int DEFAULT_DEDUP_PERIOD = 3;
 const int MAX_OBJ_WINDOW_SIZE = 100;
+const int MAX_BUCKET_WINDOW_SIZE = 100;
 
 class RGWDedup : public DoutPrefixProvider {
   CephContext* cct;
@@ -57,7 +58,6 @@ class RGWDedup : public DoutPrefixProvider {
     const DoutPrefixProvider* dpp;
     CephContext* cct;
     RGWDedup* dedup;
-    //RGWRados* store;
     rgw::sal::Store* store;
 
     std::atomic<bool> down_flag = { false };
@@ -95,7 +95,6 @@ public:
   RGWDedup() : cct(nullptr), store(nullptr) {}
   ~RGWDedup() override {}
 
-  //void initialize(CephContext* _cct, RGWRados* _store);
   void initialize(CephContext* _cct, rgw::sal::Store* _store);
   void finalize();
   int process();
