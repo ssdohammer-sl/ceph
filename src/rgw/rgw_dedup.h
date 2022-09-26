@@ -76,8 +76,8 @@ class RGWDedup : public DoutPrefixProvider {
     list<rgw_bucket_dir_entry> objects;
 
   public:
-    DedupProcessor(const DoutPrefixProvider* _dpp, CephContext* _cct, RGWDedup* _dedup,
-                   rgw::sal::Store* _store)
+    DedupProcessor(const DoutPrefixProvider* _dpp, CephContext* _cct,
+		   RGWDedup* _dedup, rgw::sal::Store* _store)
       : dpp(_dpp), cct(_cct), dedup(_dedup), store(_store) {}
     ~DedupProcessor() {}
     void* entry() override;
@@ -93,7 +93,7 @@ class RGWDedup : public DoutPrefixProvider {
 
 public:
   RGWDedup() : cct(nullptr), store(nullptr) {}
-  ~RGWDedup() override {}
+  ~RGWDedup() override;
 
   void initialize(CephContext* _cct, rgw::sal::Store* _store);
   void finalize();

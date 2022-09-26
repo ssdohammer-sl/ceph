@@ -6891,6 +6891,8 @@ int main(int argc, const char **argv)
       }
       RGWBucketAdminOp::info(store, bucket_op, stream_flusher, null_yield, dpp());
     } else {
+      cout << "get objects from bucket name: " << bucket_name << " id: " << bucket_id 
+	<< " tenant: " << tenant << std::endl;
       int ret = init_bucket(user.get(), tenant, bucket_name, bucket_id, &bucket);
       if (ret < 0) {
         cerr << "ERROR: could not init bucket: " << cpp_strerror(-ret) << std::endl;

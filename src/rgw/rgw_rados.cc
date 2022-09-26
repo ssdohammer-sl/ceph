@@ -1253,6 +1253,10 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
   } else {
     ldpp_dout(dpp, 0) << "note: Dedup not initialized" << dendl;
   }
+  // TODO need to be deleted
+  sleep(5);
+  delete dedup;
+  dedup = nullptr;
 
   auto& current_period = svc.zone->get_current_period();
   auto& zonegroup = svc.zone->get_zonegroup();

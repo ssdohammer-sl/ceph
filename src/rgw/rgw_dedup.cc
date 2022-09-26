@@ -32,7 +32,7 @@ void RGWDedup::initialize(CephContext* _cct, rgw::sal::Store* _store)
 
 void RGWDedup::finalize()
 {
-
+  // wrapup member variables of RGWDedup
 }
 
 // DedupWorkers call it
@@ -55,28 +55,30 @@ bool RGWDedup::going_down()
 void RGWDedup::start_processor()
 {
   // starts DedupProcessor
-  proc.reset(new DedupProcessor(this, cct, this, store));
-  proc->create("dedup_proc");
-  ldout(cct, 0) << __func__ << " start DedupProcessor done" << dendl;
+  if (run_dedup) {
+    proc.reset(new DedupProcessor(this, cct, this, store));
+    proc->create("dedup_proc");
+    ldout(cct, 0) << __func__ << " start DedupProcessor done" << dendl;
+  }
 }
 
 void RGWDedup::stop_processor()
 {
-  run_dedup = true;
+  // stop RGWDedup threads
+  run_dedup = false;
   if (proc.get()) {
     proc->stop();
     proc->join();
   }
-  delete proc;
-  proc = nullptr;
+  proc.reset();
 }
-/*
+
 RGWDedup::~RGWDedup()
 {
   stop_processor();
   finalize();
 }
-*/
+
 
 int RGWDedup::DedupProcessor::get_users()
 {
@@ -180,11 +182,10 @@ void* RGWDedup::DedupProcessor::entry()
 {
   while (!down_flag)
   {
-    //get_users();
     get_buckets();
     get_objects();
-    ldout(cct, 0) << __func__ << " " << buckets.size() << " buckets, " << objects.size()
-      << " objects found" << dendl;
+    ldout(cct, 0) << __func__ << " " << buckets.size() << " buckets, " 
+      << objects.size() << " objects found" << dendl;
     for (auto i = 0; i < num_workers; i++)
     {
       unique_ptr<DedupWorker> ptr(new DedupWorker(dpp, cct, i));
@@ -192,6 +193,7 @@ void* RGWDedup::DedupProcessor::entry()
       workers.emplace_back(move(ptr));
     }
 
+    // wait for all workers until it finishes their jobs
     for (auto& w: workers)
     {
       w->join();
@@ -205,8 +207,15 @@ void* RGWDedup::DedupProcessor::entry()
 
 void RGWDedup::DedupProcessor::stop()
 {
-  std::lock_guard l{lock};
-  cond.notify_all();
+  ldout(cct, 0) << "DedupProcessor " << __func__ << dendl;
+  for (auto& worker : workers) {
+    if (worker.get()) {
+      worker->stop();
+      worker->join();
+    }
+    worker.reset();
+  }
+  ldout(cct, 0) << __func__ << " stop all DedupWorkers done" << dendl;
 }
 
 
@@ -220,7 +229,7 @@ void *RGWDedup::DedupWorker::entry()
 
 void RGWDedup::DedupWorker::stop()
 {
-  std::lock_guard l{lock};
-  cond.notify_all();
+  ldout(cct, 0) << __func__ << " DedupWorker_" << id << " stopped" << dendl;
+
 }
 
