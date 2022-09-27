@@ -33,25 +33,27 @@ class RGWDedup : public DoutPrefixProvider {
   rgw::sal::Store* store;
   std::atomic<bool> run_dedup = { true };   // TODO: need to be false. use config
 
+  class DedupProcessor;
   class DedupWorker : public Thread {
     const DoutPrefixProvider* dpp;
     CephContext* cct;
-    ceph::mutex lock = ceph::make_mutex("DedupWorker");
-    ceph::condition_variable cond;
     uint32_t id;
-
+    DedupProcessor* proc;
     rgw::sal::Store* store;
 
   public:
-    DedupWorker(const DoutPrefixProvider* _dpp, CephContext* _cct, uint32_t _id)
-      : dpp(_dpp), cct(_cct), id(_id) {}
+    DedupWorker(const DoutPrefixProvider* _dpp, 
+                CephContext* _cct, 
+                uint32_t _id, 
+                DedupProcessor* _proc)
+      : dpp(_dpp), cct(_cct), id(_id), proc(_proc) {}
     ~DedupWorker() {
       ldout(cct, 0) << "DedupWorker_" << id << " destructed" << dendl;
     }
-    void *entry() override;
+    void* entry() override;
     void stop();
 
-    friend class DedupDaemon;
+    friend class DedupProcessor;
   };
 
   class DedupProcessor : public Thread {
@@ -63,7 +65,7 @@ class RGWDedup : public DoutPrefixProvider {
     std::atomic<bool> down_flag = { false };
     int num_workers = DEFAULT_NUM_WORKERS;
     int dedup_period = DEFAULT_DEDUP_PERIOD;
-    list<unique_ptr<RGWDedup::DedupWorker>> workers;
+    vector<unique_ptr<RGWDedup::DedupWorker>> workers;
     /*
     uint32_t dedup_period;
     double sampling_ratio;
@@ -71,17 +73,23 @@ class RGWDedup : public DoutPrefixProvider {
     uint32_t chunk_dedup_threshold;
     string fp_algo;
     */
-    list<string> users;
-    list<string> buckets;
-    list<rgw_bucket_dir_entry> objects;
+    vector<string> users;
+    set<string> buckets;
+    vector<rgw_bucket_dir_entry> objects;
 
   public:
-    DedupProcessor(const DoutPrefixProvider* _dpp, CephContext* _cct,
-		   RGWDedup* _dedup, rgw::sal::Store* _store)
-      : dpp(_dpp), cct(_cct), dedup(_dedup), store(_store) {}
+    DedupProcessor(const DoutPrefixProvider* _dpp, 
+                   CephContext* _cct,
+		   RGWDedup* _dedup, 
+                   rgw::sal::Store* _store)
+      : dpp(_dpp), cct(_cct), dedup(_dedup), store(_store) 
+    {}
     ~DedupProcessor() {}
     void* entry() override;
     void stop();
+    void finalize();
+    bool going_down();
+    void initialize();
 
     int get_users();
     int get_buckets();

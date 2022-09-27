@@ -57,6 +57,7 @@ void RGWDedup::start_processor()
   // starts DedupProcessor
   if (run_dedup) {
     proc.reset(new DedupProcessor(this, cct, this, store));
+    proc->initialize();
     proc->create("dedup_proc");
     ldout(cct, 0) << __func__ << " start DedupProcessor done" << dendl;
   }
@@ -65,11 +66,12 @@ void RGWDedup::start_processor()
 void RGWDedup::stop_processor()
 {
   // stop RGWDedup threads
-  run_dedup = false;
   if (proc.get()) {
     proc->stop();
     proc->join();
+    proc->finalize();
   }
+  run_dedup = false;
   proc.reset();
 }
 
@@ -79,6 +81,21 @@ RGWDedup::~RGWDedup()
   finalize();
 }
 
+
+void RGWDedup::DedupProcessor::initialize()
+{
+  // reserve DedupWorkers
+  workers.reserve(num_workers);
+  for (int i = 0; i < num_workers; ++i) {
+    auto worker = std::make_unique<RGWDedup::DedupWorker>(dpp, cct, i, this);
+    workers.emplace_back(std::move(worker));
+  }
+  get_buckets();
+  get_objects();
+  ldout(cct, 0) << __func__ << " initialize DedupWorker done" << dendl;
+  ldout(cct, 0) << "  " << buckets.size() << " buckets, " 
+    << objects.size() << " objects found" << dendl;
+}
 
 int RGWDedup::DedupProcessor::get_users()
 {
@@ -123,7 +140,8 @@ int RGWDedup::DedupProcessor::get_buckets()
   string bucket_name;
   bool truncated = true;
   list<string> bucket_list;
-  ret = store->meta_list_keys_next(dpp, handle, MAX_BUCKET_WINDOW_SIZE, bucket_list, &truncated);
+  ret = store->meta_list_keys_next(dpp, handle, MAX_BUCKET_WINDOW_SIZE, 
+                                   bucket_list, &truncated);
   if (ret != -ENOENT) {
     if (bucket_list.size() == 0) {
       ldout(cct, 0) << __func__ << " no bucket exists" << dendl;
@@ -132,7 +150,7 @@ int RGWDedup::DedupProcessor::get_buckets()
     for (list<string>::iterator iter = bucket_list.begin();
 	 iter != bucket_list.end();
 	 ++iter) {
-      buckets.emplace_back(*iter);
+      buckets.insert(*iter);
     }
   }
   store->meta_list_keys_complete(handle);
@@ -168,8 +186,19 @@ int RGWDedup::DedupProcessor::get_objects()
         return -ret;
       }
       for (auto obj : results.objs) {
-        objects.emplace_back(obj);
-        //ldout(cct, 0) << "  " << obj.key.name << "  index_ver: " << obj.index_ver << "  versioned_epoch: " << obj.versioned_epoch << "  pool: " << obj.ver.pool << "  epoch: " << obj.ver.epoch << dendl;
+        bool is_contained = false;
+        for (auto o : objects) {
+          if (o.key.name == obj.key.name && o.tag == obj.tag) {
+            is_contained = true;
+            break;
+          }
+        }
+        if (!is_contained) {
+          objects.emplace_back(obj);
+        }
+        //ldout(cct, 0) << "  " << obj.key.name << "  index_ver: " << obj.index_ver 
+        //    << "  versioned_epoch: " << obj.versioned_epoch << "  pool: " 
+        //    << obj.ver.pool << "  epoch: " << obj.ver.epoch << dendl;
       }
       is_truncated = results.is_truncated;
     }
@@ -186,50 +215,77 @@ void* RGWDedup::DedupProcessor::entry()
     get_objects();
     ldout(cct, 0) << __func__ << " " << buckets.size() << " buckets, " 
       << objects.size() << " objects found" << dendl;
+
+    // trigger DedupWorkers
     for (auto i = 0; i < num_workers; i++)
     {
-      unique_ptr<DedupWorker> ptr(new DedupWorker(dpp, cct, i));
-      ptr->create("dedup_worker_" + i);
-      workers.emplace_back(move(ptr));
+      workers[i]->create("dedup_worker_" + i);
     }
 
-    // wait for all workers until it finishes their jobs
+    ldout(cct, 0) << __func__ << " " << workers.size() << " workers started" << dendl;
+    // wait for all workers until they finish their job
     for (auto& w: workers)
     {
       w->join();
     }
 
+    if (down_flag) {
+      break;
+    }
     sleep(dedup_period);
   } // done while
+  ldout(cct, 0) << __func__ << " DedupProcessor going down" << dendl;
 
   return nullptr;
 }
 
 void RGWDedup::DedupProcessor::stop()
 {
-  ldout(cct, 0) << "DedupProcessor " << __func__ << dendl;
+  ldout(cct, 0) << "DedupProcessor::" << __func__ << dendl;
   for (auto& worker : workers) {
     if (worker.get()) {
       worker->stop();
-      worker->join();
     }
+  }
+
+  down_flag = true;
+  ldout(cct, 0) << __func__ << " stop all DedupWorkers done" << dendl;
+}
+
+void RGWDedup::DedupProcessor::finalize()
+{
+  for (auto& worker : workers) {
     worker.reset();
   }
-  ldout(cct, 0) << __func__ << " stop all DedupWorkers done" << dendl;
+  workers.clear();
+  ldout(cct, 0) << "DedupProcessor::" << __func__ << " done" << dendl;
+}
+
+bool RGWDedup::DedupProcessor::going_down()
+{
+  return down_flag;
 }
 
 
 // what dedup worker actually do
-void *RGWDedup::DedupWorker::entry()
+void* RGWDedup::DedupWorker::entry()
 {
   ldout(cct, 0) << __func__ << " DedupWorker_" << id << " started" << dendl;
+  for (int i = 0; i < 10; i++) {
+    if (proc->going_down()) {
+      break;
+    }
+    ldout(cct, 0) << "  DedupWorker_" << id << " working" << dendl;
+    sleep(3);
+  }
+  ldout(cct, 0) << __func__ << " DedupWorker_" << id << " going down" << dendl;
 
   return nullptr;
 }
 
 void RGWDedup::DedupWorker::stop()
 {
+  // do something for stop DedupWorker
   ldout(cct, 0) << __func__ << " DedupWorker_" << id << " stopped" << dendl;
-
 }
 

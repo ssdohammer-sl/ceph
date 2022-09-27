@@ -1249,14 +1249,15 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
     dedup = new RGWDedup();
     dedup->initialize(cct, this->store);
     dedup->start_processor();
-    ldpp_dout(dpp, 0) << "RGWDedup initialized and started" << dendl;
+
+    // TODO need to be deleted (for test)
+    sleep(30);
+    ldout(cct, 0) << __func__ << " RGWDedup delete" << dendl;
+    delete dedup;
+    dedup = nullptr;
   } else {
     ldpp_dout(dpp, 0) << "note: Dedup not initialized" << dendl;
   }
-  // TODO need to be deleted
-  sleep(5);
-  delete dedup;
-  dedup = nullptr;
 
   auto& current_period = svc.zone->get_current_period();
   auto& zonegroup = svc.zone->get_zonegroup();
