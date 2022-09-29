@@ -1219,7 +1219,7 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
   if (ret < 0)
     return ret;
 
-/*  TODO need to create chunk pool
+/*  FIXME: need to create chunk pool
   ret = open_dedup_chunk_pool_ctx(dpp);
   if (ret < 0) {
     ldpp_dout(dpp, 0) << __func__ << " failed to open dedup_chunk_pool" << dendl;
@@ -1243,20 +1243,20 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
     obj_expirer->start_processor();
   }
 
-  ldout(cct, 0) << __func__ << " use_dedup_threads: " << use_dedup_threads 
-    << " and init RGWDedup" << dendl;
   if (use_dedup_threads) {
     dedup = new RGWDedup();
-    dedup->initialize(cct, this->store);
-    dedup->start_processor();
+    int ret = dedup->initialize(cct, this->store);
+    // If there are no buckets or objects, do not start DedupWorkers
+    if (ret == 0) {
+      dedup->start_processor();
+    }
 
     // TODO need to be deleted (for test)
     sleep(30);
-    ldout(cct, 0) << __func__ << " RGWDedup delete" << dendl;
     delete dedup;
     dedup = nullptr;
   } else {
-    ldpp_dout(dpp, 0) << "note: Dedup not initialized" << dendl;
+    ldpp_dout(dpp, 5) << "note: RGWDedup not initialized" << dendl;
   }
 
   auto& current_period = svc.zone->get_current_period();

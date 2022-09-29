@@ -5,19 +5,15 @@
 #define CEPH_RGW_DEDUP_H
 
 
-#include "include/types.h"
-#include "include/rados/librados.hpp"
-#include "common/ceph_mutex.h"
-#include "common/Cond.h"
-#include "common/Thread.h"
-#include "rgw_common.h"
-#include "rgw_sal.h"
-#include "rgw_rados.h"
-#include "cls/rgw/cls_rgw_types.h"
-
 #include <string>
 #include <atomic>
 #include <sstream>
+
+#include "include/types.h"
+#include "common/Cond.h"
+#include "common/Thread.h"
+#include "rgw_sal.h"
+
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -25,13 +21,13 @@ using namespace std;
 
 const int DEFAULT_NUM_WORKERS = 2;
 const int DEFAULT_DEDUP_PERIOD = 3;
-const int MAX_OBJ_WINDOW_SIZE = 100;
-const int MAX_BUCKET_WINDOW_SIZE = 100;
+const int MAX_OBJ_SCAN_SIZE = 100;
+const int MAX_BUCKET_SCAN_SIZE = 100;
 
-class RGWDedup : public DoutPrefixProvider {
+class RGWDedup : public DoutPrefixProvider 
+{
   CephContext* cct;
   rgw::sal::Store* store;
-  std::atomic<bool> run_dedup = { true };   // TODO: need to be false. use config
 
   class DedupProcessor;
   class DedupWorker : public Thread {
@@ -40,6 +36,7 @@ class RGWDedup : public DoutPrefixProvider {
     uint32_t id;
     DedupProcessor* proc;
     rgw::sal::Store* store;
+    bool is_run = { false };
 
   public:
     DedupWorker(const DoutPrefixProvider* _dpp, 
@@ -66,16 +63,8 @@ class RGWDedup : public DoutPrefixProvider {
     int num_workers = DEFAULT_NUM_WORKERS;
     int dedup_period = DEFAULT_DEDUP_PERIOD;
     vector<unique_ptr<RGWDedup::DedupWorker>> workers;
-    /*
-    uint32_t dedup_period;
-    double sampling_ratio;
-    uint32_t chunk_size;
-    uint32_t chunk_dedup_threshold;
-    string fp_algo;
-    */
-    vector<string> users;
-    set<string> buckets;
-    vector<rgw_bucket_dir_entry> objects;
+    list <string> buckets;
+    list<rgw_bucket_dir_entry> objects;
 
   public:
     DedupProcessor(const DoutPrefixProvider* _dpp, 
@@ -89,11 +78,11 @@ class RGWDedup : public DoutPrefixProvider {
     void stop();
     void finalize();
     bool going_down();
-    void initialize();
+    int initialize();
 
-    int get_users();
     int get_buckets();
     int get_objects();
+    int process();
 
     friend class RGWDedup;
   };
@@ -103,15 +92,14 @@ public:
   RGWDedup() : cct(nullptr), store(nullptr) {}
   ~RGWDedup() override;
 
-  void initialize(CephContext* _cct, rgw::sal::Store* _store);
+  int initialize(CephContext* _cct, rgw::sal::Store* _store);
   void finalize();
   int process();
 
-  bool going_down();
   void start_processor();
   void stop_processor();
 
-  CephContext *get_cct() const override { return cct; }
+  CephContext* get_cct() const override { return cct; }
   unsigned get_subsys() const override { return dout_subsys; }
   std::ostream& gen_prefix(std::ostream& out) const override { return out << "RGWDedup: "; }
 };
