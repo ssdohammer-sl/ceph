@@ -11,7 +11,7 @@ int RGWDedup::initialize(CephContext* _cct, rgw::sal::Store* _store)
 {
   cct = _cct;
   store = _store;
-  proc.reset(new DedupProcessor(this, cct, this, store));
+  proc = make_unique<DedupProcessor>(this, cct, this, store);
   return proc->initialize();
 }
 

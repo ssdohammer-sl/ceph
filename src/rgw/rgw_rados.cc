@@ -1244,7 +1244,7 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
   }
 
   if (use_dedup_threads) {
-    dedup = new RGWDedup();
+    dedup = std::make_shared<RGWDedup>();
     int ret = dedup->initialize(cct, this->store);
     // If there are no buckets or objects, do not start DedupWorkers
     if (ret == 0) {
@@ -1253,8 +1253,7 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
 
     // TODO need to be deleted (for test)
     sleep(30);
-    delete dedup;
-    dedup = nullptr;
+    dedup.reset();
   } else {
     ldpp_dout(dpp, 5) << "note: RGWDedup not initialized" << dendl;
   }

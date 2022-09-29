@@ -365,7 +365,7 @@ class RGWRados
   RGWGC *gc = nullptr;
   RGWLC *lc;
   RGWObjectExpirer *obj_expirer;
-  RGWDedup *dedup = nullptr;
+  std::shared_ptr<RGWDedup> dedup;
   bool use_gc_thread;
   bool use_lc_thread;
   bool quota_threads;
@@ -495,8 +495,8 @@ public:
     return gc;
   }
 
-  RGWDedup *get_dedup() {
-    return dedup;
+  RGWDedup* get_dedup() {
+    return dedup.get();
   }
 
   RGWRados& set_run_gc_thread(bool _use_gc_thread) {
