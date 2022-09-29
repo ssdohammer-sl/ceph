@@ -63,7 +63,7 @@ class RGWDedup : public DoutPrefixProvider
     int num_workers = DEFAULT_NUM_WORKERS;
     int dedup_period = DEFAULT_DEDUP_PERIOD;
     vector<unique_ptr<RGWDedup::DedupWorker>> workers;
-    list <string> buckets;
+    list<string> buckets;
     list<rgw_bucket_dir_entry> objects;
 
   public:
