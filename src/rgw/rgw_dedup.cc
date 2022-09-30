@@ -1,7 +1,9 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
+
 #include "rgw_dedup.h"
+#include "common/CDC.h"
 
 
 using namespace std;
@@ -178,6 +180,12 @@ void* RGWDedup::DedupProcessor::entry()
     ldout(cct, 5) << __func__ << " " << buckets.size() << " buckets, " 
       << objects.size() << " objects found" << dendl;
 
+    // sampling target objects from objects
+    auto sampled_indexes = sample_objects();
+
+    // allocate target objects to DedupWorker
+
+
     // trigger DedupWorkers
     for (auto i = 0; i < num_workers; i++)
     {
@@ -225,6 +233,23 @@ void RGWDedup::DedupProcessor::finalize()
 bool RGWDedup::DedupProcessor::going_down()
 {
   return down_flag;
+}
+
+vector<size_t> RGWDedup::DedupProcessor::sample_objects()
+{
+  size_t num_objs = objects.size();
+  vector<size_t> indexes(num_objs);
+  // fill out vector to get sampled indexes
+  for (size_t i = 0; i < num_objs; i++) {
+    indexes[i] = i;
+  }
+
+  default_random_engine generator;
+  shuffle(indexes.begin(), indexes.end(), generator);
+  size_t sampling_count = static_cast<double>(count) * sampling_ratio;
+  indexes.resize(sampling_count);
+
+  return indexes;
 }
 
 

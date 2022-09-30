@@ -21,6 +21,7 @@ using namespace std;
 
 const int DEFAULT_NUM_WORKERS = 2;
 const int DEFAULT_DEDUP_PERIOD = 3;
+const double DEFAULT_SAMPLING_RATIO = 0.5;
 const int MAX_OBJ_SCAN_SIZE = 100;
 const int MAX_BUCKET_SCAN_SIZE = 100;
 
@@ -66,6 +67,8 @@ class RGWDedup : public DoutPrefixProvider
     list<string> buckets;
     list<rgw_bucket_dir_entry> objects;
 
+    double sampling_ratio = DEFAULT_SAMPLING_RATIO;
+
   public:
     DedupProcessor(const DoutPrefixProvider* _dpp, 
                    CephContext* _cct,
@@ -83,6 +86,10 @@ class RGWDedup : public DoutPrefixProvider
     int get_buckets();
     int get_objects();
     int process();
+
+  private:
+    vector<size_t> sample_objects();
+    bufferlist read_object(string name);
 
     friend class RGWDedup;
   };
