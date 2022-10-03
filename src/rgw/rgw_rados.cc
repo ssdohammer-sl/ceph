@@ -1252,6 +1252,7 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
     }
 
     // TODO need to be deleted (for test)
+    // Test code for delete RGWDedup object
     sleep(30);
     dedup.reset();
   } else {

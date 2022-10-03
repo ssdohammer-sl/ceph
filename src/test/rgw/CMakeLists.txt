@@ -241,3 +241,8 @@ add_executable(unittest_rgw_lua test_rgw_lua.cc)
 add_ceph_unittest(unittest_rgw_lua)
 target_link_libraries(unittest_rgw_lua ${rgw_libs})
 
+# unittest_rgw_dedup
+add_executable(unittest_rgw_dedup test_rgw_dedup.cc)
+add_ceph_unittest(unittest_rgw_dedup)
+target_link_libraries(unittest_rgw_dedup ${rgw_libs})
+

@@ -19,11 +19,12 @@
 
 using namespace std;
 
-const int DEFAULT_NUM_WORKERS = 2;
-const int DEFAULT_DEDUP_PERIOD = 3;
-const double DEFAULT_SAMPLING_RATIO = 0.5;
-const int MAX_OBJ_SCAN_SIZE = 100;
-const int MAX_BUCKET_SCAN_SIZE = 100;
+
+extern const int DEFAULT_NUM_WORKERS;
+extern const int DEFAULT_DEDUP_PERIOD;
+extern const double DEFAULT_SAMPLING_RATIO;
+extern const int MAX_OBJ_SCAN_SIZE;
+extern const int MAX_BUCKET_SCAN_SIZE;
 
 class RGWDedup : public DoutPrefixProvider 
 {
@@ -36,20 +37,24 @@ class RGWDedup : public DoutPrefixProvider
     CephContext* cct;
     uint32_t id;
     DedupProcessor* proc;
-    rgw::sal::Store* store;
-    bool is_run = { false };
+    bool is_run;
+    vector<rgw_bucket_dir_entry> objects;
 
   public:
     DedupWorker(const DoutPrefixProvider* _dpp, 
                 CephContext* _cct, 
                 uint32_t _id, 
                 DedupProcessor* _proc)
-      : dpp(_dpp), cct(_cct), id(_id), proc(_proc) {}
+      : dpp(_dpp), cct(_cct), id(_id), proc(_proc), is_run(false) {}
     ~DedupWorker() {
       ldout(cct, 0) << "DedupWorker_" << id << " destructed" << dendl;
     }
     void* entry() override;
     void stop();
+    void append_obj(rgw_bucket_dir_entry obj) { objects.emplace_back(obj); }
+    const size_t get_num_objs() { return objects.size(); }
+    void clear_objs() { objects.clear(); }
+    void set_run(bool run) { is_run = run; }
 
     friend class DedupProcessor;
   };
@@ -60,22 +65,24 @@ class RGWDedup : public DoutPrefixProvider
     RGWDedup* dedup;
     rgw::sal::Store* store;
 
-    std::atomic<bool> down_flag = { false };
-    int num_workers = DEFAULT_NUM_WORKERS;
-    int dedup_period = DEFAULT_DEDUP_PERIOD;
+    bool down_flag;
+    int num_workers;
+    int dedup_period;
     vector<unique_ptr<RGWDedup::DedupWorker>> workers;
-    list<string> buckets;
-    list<rgw_bucket_dir_entry> objects;
+    vector<string> buckets;
+    vector<rgw_bucket_dir_entry> objects;
 
-    double sampling_ratio = DEFAULT_SAMPLING_RATIO;
+    double sampling_ratio;
 
   public:
     DedupProcessor(const DoutPrefixProvider* _dpp, 
                    CephContext* _cct,
 		   RGWDedup* _dedup, 
                    rgw::sal::Store* _store)
-      : dpp(_dpp), cct(_cct), dedup(_dedup), store(_store) 
-    {}
+      : dpp(_dpp), cct(_cct), dedup(_dedup), store(_store), down_flag(true),
+        num_workers(DEFAULT_NUM_WORKERS),
+        dedup_period(DEFAULT_DEDUP_PERIOD),
+        sampling_ratio(DEFAULT_SAMPLING_RATIO) {}
     ~DedupProcessor() {}
     void* entry() override;
     void stop();
@@ -85,7 +92,9 @@ class RGWDedup : public DoutPrefixProvider
 
     int get_buckets();
     int get_objects();
-    int process();
+    int process(const rgw_bucket_dir_entry obj);
+    void set_flag(bool flag) { down_flag = flag; }
+    bool get_flag() { return down_flag; }
 
   private:
     vector<size_t> sample_objects();
@@ -110,6 +119,5 @@ public:
   unsigned get_subsys() const override { return dout_subsys; }
   std::ostream& gen_prefix(std::ostream& out) const override { return out << "RGWDedup: "; }
 };
-
 
 #endif
