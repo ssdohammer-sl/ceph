@@ -78,9 +78,11 @@ int RGWDedup::DedupProcessor::initialize()
  * DedupWorkers call this function
  * to tell the objects which have benefits to dedup and dedup them.
  */
-int RGWDedup::DedupProcessor::process()
+//int RGWDedup::DedupProcessor::process(const rgw_bucket_dir_entry obj)
+int RGWDedup::DedupProcessor::process(rgw::sal::Object* obj)
 {
   // TBD
+/*
   IoCtx ioctx;
   int ret = static_cast<rgw::sal::RadosStore*>(store)->getRados()
               ->get_rados_handle()->ioctx_create2(obj.ver.pool, &ioctx);
@@ -88,14 +90,21 @@ int RGWDedup::DedupProcessor::process()
     ldout(cct, 0) << "Failed to get IoCtx. pool id: " << obj.ver.pool << dendl;
     return -1;
   }
-
+*/
 
   // read object
   //librados::ObjectReadOperation op;
   //auto ret = rgw_rados_operate(dpp, *(store->getRados()->get_));
-  bufferlist bl;
-  unique_ptr<rgw::sal::Object::ReadOp> read_op;
-  ret = read_op->read(, , &bl, ,dpp);
+  //RGWRados::Object src_obj(store, bucket, ctx, obj);
+  //RGWRados::Object::Read read_op(&src_obj);
+  //unique_ptr<rgw::sal::Object::ReadOp> read_op;
+  
+  //bufferlist bl;
+  //ret = read_op->read(, , &bl, ,dpp);
+  ldout(cct, 0) << __func__ << " process object " << obj->get_name() << dendl;
+  unique_ptr<rgw::sal::Object::ReadOp> read_op = obj->get_read_op();
+  int ret = read_op->prepare(null_yield, dpp);
+
 
 
   // chunking
@@ -108,7 +117,6 @@ int RGWDedup::DedupProcessor::process()
 
   
   // dedup or flush if needed
-  
 
   return 0;
 }
@@ -117,67 +125,67 @@ int RGWDedup::DedupProcessor::process()
  */
 int RGWDedup::DedupProcessor::get_buckets()
 {
-  void* handle;
-  int ret = store->meta_list_keys_init(dpp, "bucket", string(), &handle);
+  void* handle = nullptr;
+  bool truncated = true;
+  int ret = 0;
+
+  ret = store->meta_list_keys_init(dpp, "bucket", string(), &handle);
   if (ret < 0) {
-    ldout(cct, 0) << __func__ << " ERROR: can't get key: " << dendl;
+    ldout(cct, 0) << __func__ << " ERROR: can't init key: " << dendl;
     return ret;
   }
 
-  string bucket_name;
-  bool truncated = true;
-  list<string> bucket_list;
   while (truncated) {
+    list<string> bucket_list;
     ret = store->meta_list_keys_next(dpp, handle, MAX_BUCKET_SCAN_SIZE, 
                                      bucket_list, &truncated);
-    if (ret == -ENOENT && bucket_list.size() == 0) {
-      ldout(cct, 0) << __func__ << " no bucket exists" << dendl;
-      store->meta_list_keys_complete(handle);
-      return ret; 
-    }
-    else if (ret < 0) {
-      store->meta_list_keys_complete(handle);
+    if (ret < 0) {
       ldout(cct, 0) << __func__ << " failed to get bucket info" << dendl;
-      return ret;
     }
     else {
       // do not allow duplicated bucket name
-      for (auto bkt : bucket_list) {
-        auto it = find(buckets.begin(), buckets.end(), bkt);
-        if (it == buckets.end()) {
-          buckets.emplace_back(bkt);
+      for (auto bucket_name : bucket_list) {
+        bool is_contain = false;
+        for (auto& b : buckets) {
+          if (b->get_name() == bucket_name) {
+            is_contain = true;
+            break;
+          }
+        }
+        if (!is_contain) {
+          unique_ptr<rgw::sal::Bucket> bkt;
+          ret = store->get_bucket(dpp, nullptr, "", bucket_name, &bkt, null_yield);
+          if (ret < 0) {
+            ldout(cct, 0) << __func__ << " ERROR: can't get bucket" << dendl;
+          }
+          buckets.emplace_back(move(bkt));
         }
       }
     }
   }
+  ldout(cct, 0) << buckets.size() << " buckets found" << dendl;
   store->meta_list_keys_complete(handle);
-
-  return 0;
+  return ret;
 }
 
 /*  Get dedup target objects of selected buckets
  */
 int RGWDedup::DedupProcessor::get_objects()
 {
+  
   if (buckets.empty()) {
     ldout(cct, 0) << __func__ << " no selected buckets" << dendl;
     return -1;
   }
 
-  for (auto bucket_name : buckets) {
-    unique_ptr<rgw::sal::Bucket> bucket;
-    rgw_bucket b{string(), bucket_name, string()};
-    int ret = store->get_bucket(dpp, nullptr, b, &bucket, null_yield);
-    if (ret < 0) {
-      ldout(cct, 0) << __func__ << " ERROR: could not init bucket" << dendl;
-      return ret;
-    }
-
-    bool truncated = true;
+  int ret = 0;
+  for (auto& bkt : buckets) {
     rgw::sal::Bucket::ListParams params;
     rgw::sal::Bucket::ListResults results;
+    bool truncated = true;
+    
     while (truncated) {
-      ret = bucket->list(dpp, params, MAX_OBJ_SCAN_SIZE, results, null_yield);
+      ret = bkt->list(dpp, params, MAX_OBJ_SCAN_SIZE, results, null_yield);
       if (ret < 0) {
         ldout(cct, 0) << " ERROR: failed to get objects from a bucket" << dendl;
         return ret;
@@ -192,13 +200,16 @@ int RGWDedup::DedupProcessor::get_objects()
         }
         if (!is_contain) {
           objects.emplace_back(obj);
+
+          objs.emplace_back(move(bkt->get_object(obj.key)));
         }
       }
       truncated = results.is_truncated;
     }
   }
- 
-  return 0;
+  ldout(cct, 0) << __func__ << " " << objs.size() << " rgw.sal.Object found" << dendl;
+
+  return ret;
 }
 
 void* RGWDedup::DedupProcessor::entry()
@@ -227,8 +238,10 @@ void* RGWDedup::DedupProcessor::entry()
     // allocate target objects to each DedupWorker
     vector<unique_ptr<RGWDedup::DedupWorker>>::iterator it = workers.begin();
     for (auto idx : sampled_indexes) {
-      rgw_bucket_dir_entry* obj = &objects[idx];
-      (*it)->append_obj(*obj);
+      // fixit
+      (*it)->append_obj(objects[idx]);
+      (*it)->append_sal_obj(objs[idx].get());
+
       if ((*it)->get_num_objs() >= num_objs_per_thread) {
         // append remain object for even distribution if remain_objs exists
         if (remain_objs) {
@@ -295,7 +308,9 @@ vector<size_t> RGWDedup::DedupProcessor::sample_objects()
     indexes[i] = i;
   }
 
-  shuffle(indexes.begin(), indexes.end(), default_random_engine());
+  // get seed of random dist from current time
+  unsigned seed = chrono::system_clock::now().time_since_epoch().count();
+  shuffle(indexes.begin(), indexes.end(), default_random_engine(seed));
   size_t sampling_count = static_cast<double>(num_objs) * sampling_ratio;
   indexes.resize(sampling_count);
 
@@ -309,12 +324,12 @@ void* RGWDedup::DedupWorker::entry()
     << objects.size() << " objects" << dendl;
   
   // FIXME: This is temporary code. Need to be replaced with DedupWorker's task
-  for (auto obj : objects) {
+  for (auto obj : objs) {
     if (!is_run) {
       break;
     }
 
-    ldout(cct, 0) << "DedupWorker_" << id << " objname: " << obj.key.name << dendl;
+    ldout(cct, 0) << "DedupWorker_" << id << " objname: " << obj->get_name() << dendl;
     proc->process(obj);
 
     sleep(2);

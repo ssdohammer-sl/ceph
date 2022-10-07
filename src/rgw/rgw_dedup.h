@@ -38,7 +38,9 @@ class RGWDedup : public DoutPrefixProvider
     uint32_t id;
     DedupProcessor* proc;
     bool is_run;
+
     vector<rgw_bucket_dir_entry> objects;
+    vector<rgw::sal::Object*> objs;
 
   public:
     DedupWorker(const DoutPrefixProvider* _dpp, 
@@ -52,8 +54,9 @@ class RGWDedup : public DoutPrefixProvider
     void* entry() override;
     void stop();
     void append_obj(rgw_bucket_dir_entry obj) { objects.emplace_back(obj); }
+    void append_sal_obj(rgw::sal::Object* obj) { objs.emplace_back(obj); }
     const size_t get_num_objs() { return objects.size(); }
-    void clear_objs() { objects.clear(); }
+    void clear_objs() { objects.clear(); objs.clear(); }
     void set_run(bool run) { is_run = run; }
 
     friend class DedupProcessor;
@@ -69,8 +72,11 @@ class RGWDedup : public DoutPrefixProvider
     int num_workers;
     int dedup_period;
     vector<unique_ptr<RGWDedup::DedupWorker>> workers;
-    vector<string> buckets;
+    vector<unique_ptr<rgw::sal::Bucket>> buckets;
+
+    // TODO: need to clear up unnecessary object components
     vector<rgw_bucket_dir_entry> objects;
+    vector<unique_ptr<rgw::sal::Object>> objs;
 
     double sampling_ratio;
 
@@ -92,7 +98,8 @@ class RGWDedup : public DoutPrefixProvider
 
     int get_buckets();
     int get_objects();
-    int process(const rgw_bucket_dir_entry obj);
+    //int process(const rgw_bucket_dir_entry obj);
+    int process(rgw::sal::Object* obj);
     void set_flag(bool flag) { down_flag = flag; }
     bool get_flag() { return down_flag; }
 
@@ -110,7 +117,6 @@ public:
 
   int initialize(CephContext* _cct, rgw::sal::Store* _store);
   void finalize();
-  int process();
 
   void start_processor();
   void stop_processor();
