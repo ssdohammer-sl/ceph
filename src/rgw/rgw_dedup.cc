@@ -1,6 +1,8 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
+#include <tuple>
+#include <utility>
 
 #include "rgw_dedup.h"
 #include "common/CDC.h"
@@ -13,6 +15,11 @@ const int DEFAULT_DEDUP_PERIOD = 3;
 const double DEFAULT_SAMPLING_RATIO = 1.0;
 const int MAX_OBJ_SCAN_SIZE = 100;
 const int MAX_BUCKET_SCAN_SIZE = 100;
+
+const string DEFAULT_CHUNK_ALGO = "fastcdc";
+const string DEFAULT_FP_ALGO = "sha1";
+const uint64_t DEFAULT_CHUNK_SIZE = 16384;
+const int DEFAULT_CHUNK_DEDUP_THRESHOLD = 2;
 
 
 int RGWDedup::initialize(CephContext* _cct, rgw::sal::Store* _store)
@@ -81,44 +88,51 @@ int RGWDedup::DedupProcessor::initialize()
 //int RGWDedup::DedupProcessor::process(const rgw_bucket_dir_entry obj)
 int RGWDedup::DedupProcessor::process(rgw::sal::Object* obj)
 {
-  // TBD
-/*
-  IoCtx ioctx;
-  int ret = static_cast<rgw::sal::RadosStore*>(store)->getRados()
-              ->get_rados_handle()->ioctx_create2(obj.ver.pool, &ioctx);
-  if (ret < 0) {
-    ldout(cct, 0) << "Failed to get IoCtx. pool id: " << obj.ver.pool << dendl;
-    return -1;
-  }
-*/
-
   // read object
-  //librados::ObjectReadOperation op;
-  //auto ret = rgw_rados_operate(dpp, *(store->getRados()->get_));
-  //RGWRados::Object src_obj(store, bucket, ctx, obj);
-  //RGWRados::Object::Read read_op(&src_obj);
-  //unique_ptr<rgw::sal::Object::ReadOp> read_op;
-  
-  //bufferlist bl;
-  //ret = read_op->read(, , &bl, ,dpp);
-  ldout(cct, 0) << __func__ << " process object " << obj->get_name() << dendl;
-  unique_ptr<rgw::sal::Object::ReadOp> read_op = obj->get_read_op();
+  unique_ptr<rgw::sal::Object::ReadOp> read_op(obj->get_read_op());
   int ret = read_op->prepare(null_yield, dpp);
-
-
+  if (ret < 0) {
+    cerr << __func__ << " failed to read " << obj->get_name() << std::endl;
+    return ret;
+  }
+  uint64_t obj_size = obj->get_obj_size();
+  bufferlist obj_data;
+  ret = read_op->read(0, obj_size, obj_data, null_yield, dpp);
 
   // chunking
-  
+  size_t total_chunk_size = 0;
+  vector<tuple<bufferlist, pair<uint64_t, uint64_t>>> chunk_info;
+  unique_ptr<CDC> cdc = CDC::create(chunk_algo, cbits(chunk_size) - 1);
+  vector<pair<uint64_t, uint64_t>> chunks;
+  cdc->calc_chunks(obj_data, &chunks);
+  for (auto& c : chunks) {
+    bufferlist chunk_data;
+    chunk_data.substr_of(obj_data, c.first, c.second);
+    chunk_info.emplace_back(make_tuple(chunk_data, c));
+    total_chunk_size += chunk_data.length();
+  }
+  if (total_chunk_size != obj_data.length()) {
+    cerr << __func__ << " total size of all chunks (" << total_chunk_size
+	 << ") is different from object data length (" << obj_data.length() << ")"
+	 << std::endl;
+    return -1;
+  }
 
   // calculate dedup ratio
+  //size_t duplicated_size = 0;
+  //list<chunk_t> redundant_chunks;
+  for (auto& chunk : chunk_info) {
+    auto& chunk_data = std::get<0>(chunk);
+    //string fingerprint = generate_fingerprint(chunk_data);
+    // <offset, length>
+    pair<uint64_t, uint64_t> chunk_boundary = std::get<1>(chunk);
 
+    // TODO: check the chunk has how much duplication
+    // update FpStore
+    // if the chunk has duplications a lot, append redundant_chunks
+  }
 
-  // update FPStore
-
-  
-  // dedup or flush if needed
-
-  return 0;
+  return ret;
 }
 
 /*  Get all buckets in a zone
@@ -131,7 +145,7 @@ int RGWDedup::DedupProcessor::get_buckets()
 
   ret = store->meta_list_keys_init(dpp, "bucket", string(), &handle);
   if (ret < 0) {
-    ldout(cct, 0) << __func__ << " ERROR: can't init key: " << dendl;
+    cerr << __func__ << " ERROR: can't init key: " << std::endl;
     return ret;
   }
 

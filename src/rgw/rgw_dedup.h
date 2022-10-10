@@ -25,6 +25,10 @@ extern const int DEFAULT_DEDUP_PERIOD;
 extern const double DEFAULT_SAMPLING_RATIO;
 extern const int MAX_OBJ_SCAN_SIZE;
 extern const int MAX_BUCKET_SCAN_SIZE;
+extern const string DEFAULT_CHUNK_ALGO;
+extern const string DEFAULT_FP_ALGO;
+extern const uint64_t DEFAULT_CHUNK_SIZE;
+extern const int DEFAULT_CHUNK_DEDUP_THRESHOLD;
 
 class RGWDedup : public DoutPrefixProvider 
 {
@@ -79,6 +83,10 @@ class RGWDedup : public DoutPrefixProvider
     vector<unique_ptr<rgw::sal::Object>> objs;
 
     double sampling_ratio;
+    string chunk_algo;
+    string fp_algo;
+    uint64_t chunk_size;
+    int chunk_dedup_threshold;
 
   public:
     DedupProcessor(const DoutPrefixProvider* _dpp, 
@@ -88,7 +96,11 @@ class RGWDedup : public DoutPrefixProvider
       : dpp(_dpp), cct(_cct), dedup(_dedup), store(_store), down_flag(true),
         num_workers(DEFAULT_NUM_WORKERS),
         dedup_period(DEFAULT_DEDUP_PERIOD),
-        sampling_ratio(DEFAULT_SAMPLING_RATIO) {}
+        sampling_ratio(DEFAULT_SAMPLING_RATIO),
+	chunk_algo(DEFAULT_CHUNK_ALGO),
+	fp_algo(DEFAULT_FP_ALGO),
+	chunk_size(DEFAULT_CHUNK_SIZE),
+	chunk_dedup_threshold(DEFAULT_CHUNK_DEDUP_THRESHOLD) {}
     ~DedupProcessor() {}
     void* entry() override;
     void stop();
