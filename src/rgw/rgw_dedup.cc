@@ -26,7 +26,7 @@ int RGWDedup::initialize(CephContext* _cct, rgw::sal::Store* _store)
 {
   cct = _cct;
   store = _store;
-  proc = make_unique<DedupProcessor>(this, cct, this, store); 
+  proc = make_unique<DedupProcessor>(this, cct, this, store);
   return proc->initialize();
 }
 
@@ -145,7 +145,8 @@ int RGWDedup::DedupProcessor::get_buckets()
 
   ret = store->meta_list_keys_init(dpp, "bucket", string(), &handle);
   if (ret < 0) {
-    cerr << __func__ << " ERROR: can't init key: " << std::endl;
+    std::cout << "meta_list_keys_init() failed" << std::endl;
+    cerr << __func__ << " ERROR: can't init key" << std::endl;
     return ret;
   }
 
@@ -154,7 +155,7 @@ int RGWDedup::DedupProcessor::get_buckets()
     ret = store->meta_list_keys_next(dpp, handle, MAX_BUCKET_SCAN_SIZE, 
                                      bucket_list, &truncated);
     if (ret < 0) {
-      ldout(cct, 0) << __func__ << " failed to get bucket info" << dendl;
+      cerr << __func__ << " failed to get bucket info" << std::endl;
     }
     else {
       // do not allow duplicated bucket name
