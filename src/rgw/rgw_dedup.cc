@@ -22,12 +22,12 @@ const uint64_t DEFAULT_CHUNK_SIZE = 16384;
 const int DEFAULT_CHUNK_DEDUP_THRESHOLD = 2;
 
 
-int RGWDedup::initialize(CephContext* _cct, rgw::sal::Store* _store)
+void RGWDedup::initialize(CephContext* _cct, rgw::sal::Store* _store)
 {
   cct = _cct;
   store = _store;
   proc = make_unique<DedupProcessor>(this, cct, this, store);
-  return proc->initialize();
+  proc->initialize();
 }
 
 void RGWDedup::finalize()
@@ -58,27 +58,14 @@ RGWDedup::~RGWDedup()
 }
 
 
-int RGWDedup::DedupProcessor::initialize()
+void RGWDedup::DedupProcessor::initialize()
 {
-  int ret = get_buckets();
-  if (ret < 0) {
-    return ret;
-  }
-  ret = get_objects();
-  if (ret < 0) {
-    return ret;
-  }
-  ldout(cct, 5) << "  " << buckets.size() << " buckets, "
-    << objects.size() << " objects found" << dendl;
-
   // reserve DedupWorkers
   workers.reserve(num_workers);
   for (int i = 0; i < num_workers; ++i) {
     auto worker = std::make_unique<RGWDedup::DedupWorker>(dpp, cct, i, this);
     workers.emplace_back(std::move(worker));
   }
-
-  return 0;
 }
 
 /* a main job of deduplication.

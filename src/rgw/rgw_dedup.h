@@ -106,7 +106,7 @@ class RGWDedup : public DoutPrefixProvider
     void stop();
     void finalize();
     bool going_down();
-    int initialize();
+    void initialize();
 
     int get_buckets();
     int get_objects();
@@ -127,7 +127,7 @@ public:
   RGWDedup() : cct(nullptr), store(nullptr) {}
   ~RGWDedup() override;
 
-  int initialize(CephContext* _cct, rgw::sal::Store* _store);
+  void initialize(CephContext* _cct, rgw::sal::Store* _store);
   void finalize();
 
   void start_processor();
