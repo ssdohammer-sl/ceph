@@ -358,7 +358,9 @@ RGWCtlDef::_meta::~_meta() {}
 
 int RGWCtlDef::init(RGWServices& svc, rgw::sal::Store* store, const DoutPrefixProvider *dpp)
 {
+  std::cout << "svc: " << &svc << " meta: " << &svc.meta << std::endl;
   meta.mgr.reset(new RGWMetadataManager(svc.meta));
+  std::cout << "meta.mgr: " << meta.mgr.get() << std::endl;
 
   meta.user.reset(RGWUserMetaHandlerAllocator::alloc(svc.user));
 
