@@ -167,7 +167,8 @@ set(librgw_common_srcs
   rgw_bucket_encryption.cc
   rgw_tracer.cc
   rgw_lua_background.cc
-  rgw_dedup.cc)
+  rgw_dedup.cc
+  rgw_dedup_proc.cc)
 
 if(WITH_RADOSGW_AMQP_ENDPOINT)
   list(APPEND librgw_common_srcs rgw_amqp.cc)

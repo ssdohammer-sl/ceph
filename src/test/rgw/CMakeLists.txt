@@ -71,6 +71,7 @@ set(test_rgw_manifest_srcs test_rgw_manifest.cc)
 add_executable(ceph_test_rgw_manifest
   ${test_rgw_manifest_srcs}
   )
+add_ceph_unittest(ceph_test_rgw_manifest)
 target_link_libraries(ceph_test_rgw_manifest
   test_rgw_a
   cls_rgw_client
@@ -244,5 +245,16 @@ target_link_libraries(unittest_rgw_lua ${rgw_libs})
 # unittest_rgw_dedup
 add_executable(unittest_rgw_dedup test_rgw_dedup.cc)
 add_ceph_unittest(unittest_rgw_dedup)
-target_link_libraries(unittest_rgw_dedup radostest-cxx ${UNITTEST_LIBS} ${rgw_libs})
-
+target_link_libraries(
+  unittest_rgw_dedup
+  test_rgw_a
+  radostest-cxx
+  ${UNITTEST_LIBS}
+  ${rgw_libs} 
+  cls_rgw_client
+  librados
+  global
+  ${CURL_LIBRARIES}
+  ${EXPAT_LIBRARIES}
+  ${CMAKE_DL_LIBS}
+)
