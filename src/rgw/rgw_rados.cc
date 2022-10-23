@@ -64,6 +64,7 @@
 
 #include "rgw_gc.h"
 #include "rgw_lc.h"
+#include "rgw_dedup.h"
 
 #include "rgw_object_expirer_core.h"
 #include "rgw_sync.h"
@@ -1364,6 +1365,14 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
   ret = rgw::notify::init(cct, store, dpp);
   if (ret < 0 ) {
     ldpp_dout(dpp, 1) << "ERROR: failed to initialize notification manager" << dendl;
+  }
+
+  if (use_dedup_threads) {
+    dedup = std::make_shared<RGWDedup>();
+    dedup->initialize(cct, this->store);
+    dedup->start_processor();
+  } else {
+    ldpp_dout(dpp, 1) << "note: RGWDedup not initialized" << dendl;
   }
 
   return ret;
