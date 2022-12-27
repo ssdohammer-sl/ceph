@@ -238,17 +238,19 @@ class EstimateDedupRatio : public CrawlerThread
   uint64_t max_seconds;
 
 public:
+  float scan_ratio = 1.0;
   EstimateDedupRatio(
     IoCtx& io_ctx, int n, int m, ObjectCursor begin, ObjectCursor end,
     string chunk_algo, string fp_algo, uint64_t chunk_size, int32_t report_period,
     uint64_t num_objects, uint64_t max_read_size,
-    uint64_t max_seconds):
+    uint64_t max_seconds, float scan_ratio):
     CrawlerThread(io_ctx, n, m, begin, end, report_period, num_objects,
 		  max_read_size),
     chunk_algo(chunk_algo),
     fp_algo(fp_algo),
     chunk_size(chunk_size),
-    max_seconds(max_seconds) {
+    max_seconds(max_seconds),
+    scan_ratio(scan_ratio) {
   }
 
   void* entry() {
@@ -334,6 +336,14 @@ public:
 
 vector<std::unique_ptr<CrawlerThread>> estimate_threads;
 
+static void handle_signal(int signum) 
+{
+  std::lock_guard l{glock};
+  for (auto &p : estimate_threads) {
+    p->signal(signum);
+  }
+}
+
 static void print_dedup_estimate(std::ostream& out, std::string chunk_algo)
 {
   /*
@@ -365,17 +375,21 @@ static void print_dedup_estimate(std::ostream& out, std::string chunk_algo)
   f->dump_unsigned("total_bytes", total_bytes);
   f->dump_float("examined_ratio", (float)examined_bytes / (float)total_bytes);
   */
+
+  uint64_t total_objects = estimate_threads[0]->get_total_objects();
+  float scan_ratio = static_cast<EstimateDedupRatio*>(estimate_threads[0].get())->scan_ratio;
+  float examined_ratio = (float)examined_objects / (float)total_objects;
+  f->dump_unsigned("total_objects", total_objects);
+  f->dump_float("scan_ratio", scan_ratio);
+  f->dump_float("examined_ratio", examined_ratio);
+  if (examined_ratio >= scan_ratio) {
+    cout << "scan " << scan_ratio << " of objects done." << std::endl;
+    handle_signal(SIGINT);
+  }
+
   f->close_section();
   f->close_section();
   f->flush(out);
-}
-
-static void handle_signal(int signum) 
-{
-  std::lock_guard l{glock};
-  for (auto &p : estimate_threads) {
-    p->signal(signum);
-  }
 }
 
 void EstimateDedupRatio::estimate_dedup_ratio()
@@ -409,7 +423,7 @@ void EstimateDedupRatio::estimate_dedup_ratio()
   {
     std::vector<ObjectItem> result;
     int r = io_ctx.object_list(c, shard_end, 12, {}, &result, &c);
-    if (r < 0 ){
+    if (r < 0 ) {
       cerr << "error object_list : " << cpp_strerror(r) << std::endl;
       return;
     }
@@ -1616,6 +1630,18 @@ int estimate_dedup_ratio(const std::map < std::string, std::string > &opts,
     debug = true;
   }
 
+  uint64_t scan_range = 1000;  // range [0, 1000]
+  float scan_ratio = 1.0;
+  i = opts.find("scan-range");
+  if (i != opts.end()) {
+    if (rados_sistrtoll(i, &scan_range)) {
+      return -EINVAL;
+    }
+  }
+  if (scan_range < 1000) {
+    scan_ratio = scan_range / 1000.0;
+  }
+
   i = opts.find("pgid");
   boost::optional<pg_t> pgid(i != opts.end(), pg_t());
 
@@ -1671,13 +1697,13 @@ int estimate_dedup_ratio(const std::map < std::string, std::string > &opts,
     return ret;
   }
   s = stats[pool_name];
-
+  
   for (unsigned i = 0; i < max_thread; i++) {
     std::unique_ptr<CrawlerThread> ptr (
       new EstimateDedupRatio(io_ctx, i, max_thread, begin, end,
 			     chunk_algo, fp_algo, chunk_size,
 			     report_period, s.num_objects, max_read_size,
-			     max_seconds));
+			     max_seconds, scan_ratio));
     ptr->create("estimate_thread");
     ptr->set_debug(debug);
     estimate_threads.push_back(move(ptr));
@@ -2094,7 +2120,8 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
 	return -1;
       }
       chunk_ref =
-	static_cast<chunk_refs_by_object_t*>(refs.r.get())->by_object.count(oid); if (chunk_ref < 0) {
+	static_cast<chunk_refs_by_object_t*>(refs.r.get())->by_object.count(oid); 
+      if (chunk_ref < 0) {
 	cerr << object_name << " has no reference of " << target_object_name
 	     << std::endl;
 	return chunk_ref;
@@ -2119,7 +2146,8 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
 	  ObjectWriteOperation op;
 	  cls_cas_chunk_put_ref(op, oid);
 	  chunk_ref--;
-	  ret = run_op(op, oid, object_name, chunk_io_ctx); if (ret < 0) {
+	  ret = run_op(op, oid, object_name, chunk_io_ctx); 
+          if (ret < 0) {
 	    return ret;
 	  }
 	}
@@ -2731,7 +2759,7 @@ int main(int argc, const char **argv)
     } else if (ceph_argparse_witharg(args, i, &val, "--report-period", (char*)NULL)) {
       opts["report-period"] = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--max-read-size", (char*)NULL)) {
-      opts["max-seconds"] = val;
+      opts["max-read-size"] = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--max-seconds", (char*)NULL)) {
       opts["max-seconds"] = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--min-chunk-size", (char*)NULL)) {
@@ -2754,6 +2782,8 @@ int main(int argc, const char **argv)
       opts["chunk-dedup-threshold"] = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--wakeup-period", (char*)NULL)) {
       opts["wakeup-period"] = val;
+    } else if (ceph_argparse_witharg(args, i, &val, "--scan-range", (char*)NULL)) {
+      opts["scan-range"] = val;
     } else if (ceph_argparse_flag(args, i, "--daemon", (char*)NULL)) {
       opts["daemon"] = "true";
     } else if (ceph_argparse_flag(args, i, "--iterative", (char*)NULL)) {
