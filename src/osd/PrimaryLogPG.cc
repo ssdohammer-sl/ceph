@@ -2517,6 +2517,32 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   maybe_force_recovery();
 }
 
+bool PrimaryLogPG::need_skip_handle_manifest(const OpRequestRef& op_req,
+                                             const bool is_chunked)
+{
+  // following ops don't need manifest handling
+  for (auto& osd_op : op_req->get_req<MOSDOp>()->ops) {
+    if (osd_op.op.op == CEPH_OSD_OP_SET_REDIRECT ||
+        osd_op.op.op == CEPH_OSD_OP_SET_CHUNK ||
+        osd_op.op.op == CEPH_OSD_OP_UNSET_MANIFEST ||
+        osd_op.op.op == CEPH_OSD_OP_TIER_PROMOTE ||
+        osd_op.op.op == CEPH_OSD_OP_TIER_FLUSH ||
+        osd_op.op.op == CEPH_OSD_OP_TIER_EVICT ||
+        osd_op.op.op == CEPH_OSD_OP_ISDIRTY) {
+      return true;
+    }
+
+    /*  in case of chunked manifest objects, read-only cls ops
+     *  that are not read_data don't need to promote chunk objects.
+     */
+    if (is_chunked && osd_op.op.op == CEPH_OSD_OP_CALL &&
+        op_req->may_read() && !op_req->may_read_data() && !op_req->may_write()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
   OpRequestRef op,
   bool write_ordered,
@@ -2544,19 +2570,11 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
     return cache_result_t::NOOP;
   }
 
-  vector<OSDOp> ops = op->get_req<MOSDOp>()->ops;
-  for (vector<OSDOp>::iterator p = ops.begin(); p != ops.end(); ++p) {
-    OSDOp& osd_op = *p;
-    ceph_osd_op& op = osd_op.op;
-    if (op.op == CEPH_OSD_OP_SET_REDIRECT ||
-	op.op == CEPH_OSD_OP_SET_CHUNK ||
-	op.op == CEPH_OSD_OP_UNSET_MANIFEST ||
-	op.op == CEPH_OSD_OP_TIER_PROMOTE ||
-	op.op == CEPH_OSD_OP_TIER_FLUSH ||
-	op.op == CEPH_OSD_OP_TIER_EVICT ||
-	op.op == CEPH_OSD_OP_ISDIRTY) {
-      return cache_result_t::NOOP;
-    }
+  // filtering ops that doesn't need proxy rw or tier promote
+  if (need_skip_handle_manifest(op, obc->obs.oi.manifest.is_chunked())) {
+    dout(20) << __func__ << ": " << obc->obs.oi.soid
+      << " doesn't need proxy rw or tier-promote" << dendl;
+    return cache_result_t::NOOP;
   }
 
   switch (obc->obs.oi.manifest.type) {
