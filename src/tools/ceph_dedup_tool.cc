@@ -565,7 +565,7 @@ public:
       if (found_iter == fp_map.end()) {
         fp_map.insert({chunk.fingerprint, 1});
       } else {
-	cur_reference = ++found_iter->second;
+        cur_reference = ++found_iter->second;
       }
       return cur_reference >= dedup_threshold && dedup_threshold != -1;
     }
@@ -626,7 +626,8 @@ private:
     ObjectCursor end,
     size_t max_object_count);
   std::vector<size_t> sample_object(size_t count);
-  void try_dedup_and_accumulate_result(ObjectItem &object);
+  void try_dedup_and_accumulate_result(ObjectItem &object, const bool archived,
+                                       const bool deduped);
   bool ok_to_dedup_all();
   int do_chunk_dedup(chunk_t &chunk);
   bufferlist read_object(ObjectItem &object);
@@ -635,6 +636,9 @@ private:
     bufferlist &data);
   std::string generate_fingerprint(bufferlist chunk_data);
   AioCompRef do_async_evict(string oid);
+  bool is_hot(ObjectItem& object, bool& archived, bool& deduped);
+  int make_object_archive(ObjectItem& object);
+  int clear_manifest(string oid);
 
   IoCtx io_ctx;
   IoCtx chunk_io_ctx;
@@ -658,7 +662,7 @@ void SampleDedupWorkerThread::crawl()
   while (current_object < end) {
     std::vector<ObjectItem> objects;
     // Get the list of object IDs to deduplicate
-    std::tie(objects, current_object) = get_objects(current_object, end, 100);
+    std::tie(objects, current_object) = get_objects(current_object, end, 500);
 
     // Pick few objects to be processed. Sampling ratio decides how many
     // objects to pick. Lower sampling ratio makes crawler have lower crawling
@@ -666,7 +670,12 @@ void SampleDedupWorkerThread::crawl()
     auto sampled_indexes = sample_object(objects.size());
     for (size_t index : sampled_indexes) {
       ObjectItem target = objects[index];
-      try_dedup_and_accumulate_result(target);
+      bool archived = false;
+      bool deduped = false;
+      if (!is_hot(target, archived, deduped)) {
+        // target is cold. try dedup
+        try_dedup_and_accumulate_result(target, archived, deduped);
+      }
     }
   }
 
@@ -731,12 +740,33 @@ std::vector<size_t> SampleDedupWorkerThread::sample_object(size_t count)
   return indexes;
 }
 
-void SampleDedupWorkerThread::try_dedup_and_accumulate_result(ObjectItem &object)
+int SampleDedupWorkerThread::clear_manifest(string oid)
+{
+  ObjectWriteOperation promote;
+  promote.tier_promote();
+  int ret = io_ctx.operate(oid, &promote);
+  if (ret < 0) {
+    cerr << __func__ << " failed to tier_promote " << oid << std::endl;
+    return ret;
+  }
+
+  ObjectWriteOperation unset_op;
+  unset_op.unset_manifest();
+  ret = io_ctx.operate(oid, &unset_op);
+  if (ret < 0) {
+    cerr << __func__ << " failed to unset_manifest " << oid << std::endl;
+  }
+  return ret;
+}
+
+void SampleDedupWorkerThread::try_dedup_and_accumulate_result(ObjectItem &object,
+                                                              const bool archived,
+                                                              const bool deduped)
 {
   bufferlist data = read_object(object);
   if (data.length() == 0) {
     cerr << __func__ << " skip object " << object.oid
-	 << " read returned size 0" << std::endl;
+      << " read returned size 0" << std::endl;
     return;
   }
   auto chunks = do_cdc(object, data);
@@ -776,14 +806,24 @@ void SampleDedupWorkerThread::try_dedup_and_accumulate_result(ObjectItem &object
     }
   }
 
-  size_t object_size = data.length();
+  if (!archived && !deduped && redundant_chunks.empty()) {
+    cout << object.oid << " is unique do archiving" << std::endl;
+    make_object_archive(object);
+  } else if (!redundant_chunks.empty()) {
+    if (archived) {
+      cout << object.oid << " archived do dedup" << std::endl;
+      if (clear_manifest(object.oid) < 0) {
+        return;
+      }
+    }
 
-  // perform chunk-dedup
-  for (auto &p : redundant_chunks) {
-    do_chunk_dedup(p);
+    // perform chunk-dedup
+    for (auto &p : redundant_chunks) {
+      do_chunk_dedup(p);
+    }
+    total_duplicated_size += duplicated_size;
+    total_object_size += data.length();
   }
-  total_duplicated_size += duplicated_size;
-  total_object_size += object_size;
 }
 
 bufferlist SampleDedupWorkerThread::read_object(ObjectItem &object)
@@ -875,6 +915,53 @@ int SampleDedupWorkerThread::do_chunk_dedup(chunk_t &chunk)
       CEPH_OSD_OP_FLAG_WITH_REFERENCE);
   ret = io_ctx.operate(chunk.oid, &op, nullptr);
   oid_for_evict.insert(chunk.oid);
+  return ret;
+}
+
+bool SampleDedupWorkerThread::is_hot(ObjectItem& object, bool& archived, bool& deduped)
+{
+  ObjectReadOperation op;
+  bool hot = false;
+  int ret = -1;
+  
+  op.is_hot(&hot, &archived, &deduped, &ret);
+  io_ctx.operate(object.oid, &op, NULL);
+  if (ret < 0) {
+    cout << __func__ << " get object(" << object.oid << " temp failed" << std::endl;
+    archived = false;
+    deduped = false;
+    return true;
+  }
+  return hot;
+}
+
+int SampleDedupWorkerThread::make_object_archive(ObjectItem& object) {
+  bufferlist data = read_object(object);
+  if (data.length() == 0) {
+    cerr << __func__ << " skip object " << object.oid
+         << " read returned size 0" << std::endl;
+    return 0;
+  }
+
+  ObjectWriteOperation wop;
+  wop.write_full(data);
+  int ret = chunk_io_ctx.operate(object.oid, &wop);
+  if (ret < 0) {
+    cerr << __func__ << " write_full failed: " << cpp_strerror(ret) << std::endl;
+    return ret;
+  }
+
+  ObjectReadOperation rop;
+  rop.set_chunk(0, data.length(), chunk_io_ctx, object.oid, 0,
+    CEPH_OSD_OP_FLAG_WITH_REFERENCE);
+  ret = io_ctx.operate(object.oid, &rop, NULL);
+  if (ret < 0) {
+    cerr << __func__ << " object(" << object.oid << ") set_chunk failed: "
+      << cpp_strerror(ret) << std::endl;
+    return ret;
+  }
+  oid_for_evict.insert(object.oid);
+
   return ret;
 }
 

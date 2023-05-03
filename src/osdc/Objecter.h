@@ -1197,6 +1197,47 @@ struct ObjectOperation {
     set_handler(h);
   }
 
+  struct C_ObjectOperation_ishot : public Context {
+    ceph::buffer::list bl;
+    bool *pishot;
+    bool *parchived;
+    bool *pdeduped;
+    int *prval;
+    C_ObjectOperation_ishot(bool *ph, bool *pa, bool *pd, int *r)
+      : pishot(ph), parchived(pa), pdeduped(pd), prval(r) {}
+    void finish(int r) override {
+      using ceph::decode;
+      if (r < 0)
+        return;
+      try{
+        auto p = bl.cbegin();
+        bool ishot, archived, deduped;
+        decode(ishot, p);
+        decode(archived, p);
+        decode(deduped, p);
+        if (pishot)
+          *pishot = ishot;
+        if (archived)
+          *parchived = archived;
+        if (deduped)
+          *pdeduped = deduped;
+      } catch (const ceph::buffer::error& e) {
+        if (prval)
+          *prval = -EIO;
+      }
+    }
+  };
+
+  void is_hot(bool *pishot, bool *parchived, bool *pdeduped, int *prval) {
+    add_op(CEPH_OSD_OP_ISHOT);
+    unsigned p = ops.size() - 1;
+    out_rval[p] = prval;
+    C_ObjectOperation_ishot *h
+      = new C_ObjectOperation_ishot(pishot, parchived, pdeduped, prval);
+    out_bl[p] = &h->bl;
+    set_handler(h);
+  }
+
   struct C_ObjectOperation_hit_set_ls : public Context {
     ceph::buffer::list bl;
     std::list< std::pair<time_t, time_t> > *ptls;

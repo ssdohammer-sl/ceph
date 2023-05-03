@@ -2273,9 +2273,13 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     m->get_snapid() == CEPH_SNAPDIR ? head : m->get_hobj();
 
   // make sure LIST_SNAPS is on CEPH_SNAPDIR and nothing else
+  bool op_is_hot = false;
   for (vector<OSDOp>::iterator p = m->ops.begin(); p != m->ops.end(); ++p) {
     OSDOp& osd_op = *p;
 
+    if (osd_op.op.op == CEPH_OSD_OP_ISHOT) {
+      op_is_hot = true;
+    }
     if (osd_op.op.op == CEPH_OSD_OP_LIST_SNAPS) {
       if (m->get_snapid() != CEPH_SNAPDIR) {
 	dout(10) << "LIST_SNAPS with incorrect context" << dendl;
@@ -2359,7 +2363,13 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
         in_hit_set = true;
     }
     if (!op->hitset_inserted) {
-      hit_set->insert(oid);
+      if (!op_is_hot) {
+        hit_set->insert(oid);
+      }
+      dout(20) << __func__ << " hit_set true " << oid << " hit_set_start_stamp: "
+        << hit_set_start_stamp << " perid: " << pool.info.hit_set_period << " stamp: "
+        << m->get_recv_stamp() << dendl;
+
       op->hitset_inserted = true;
       if (hit_set->is_full() ||
           hit_set_start_stamp + pool.info.hit_set_period <= m->get_recv_stamp()) {
@@ -2538,14 +2548,27 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
   vector<OSDOp> ops = op->get_req<MOSDOp>()->ops;
   for (vector<OSDOp>::iterator p = ops.begin(); p != ops.end(); ++p) {
     OSDOp& osd_op = *p;
-    ceph_osd_op& op = osd_op.op;
-    if (op.op == CEPH_OSD_OP_SET_REDIRECT ||
-	op.op == CEPH_OSD_OP_SET_CHUNK ||
-	op.op == CEPH_OSD_OP_UNSET_MANIFEST ||
-	op.op == CEPH_OSD_OP_TIER_PROMOTE ||
-	op.op == CEPH_OSD_OP_TIER_FLUSH ||
-	op.op == CEPH_OSD_OP_TIER_EVICT ||
-	op.op == CEPH_OSD_OP_ISDIRTY) {
+    ceph_osd_op& coop = osd_op.op;
+    if (coop.op == CEPH_OSD_OP_SET_REDIRECT ||
+	coop.op == CEPH_OSD_OP_SET_CHUNK ||
+	coop.op == CEPH_OSD_OP_UNSET_MANIFEST ||
+	coop.op == CEPH_OSD_OP_TIER_PROMOTE ||
+	coop.op == CEPH_OSD_OP_TIER_FLUSH ||
+	coop.op == CEPH_OSD_OP_TIER_EVICT ||
+	coop.op == CEPH_OSD_OP_ISDIRTY ||
+	coop.op == CEPH_OSD_OP_ISHOT) {
+      if (coop.op == CEPH_OSD_OP_SET_CHUNK) {
+        if (!hit_set) {
+          hit_set_setup();
+        }
+        if (agent_state) {
+          if (agent_choose_mode(false, op)) {
+            return cache_result_t::NOOP;
+          }
+        } else {
+          agent_setup();
+        }
+      }
       return cache_result_t::NOOP;
     }
   }
@@ -6220,6 +6243,48 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	encode(is_dirty, osd_op.outdata);
 	ctx->delta_stats.num_rd++;
 	result = 0;
+      }
+      break;
+
+    case CEPH_OSD_OP_ISHOT:
+      ++ctx->num_read;
+      {
+        bool is_hot = hit_set->contains(oi.soid);
+        if (hit_set && !is_hot) {
+          for (auto iter = agent_state->hit_set_map.crbegin();
+               iter != agent_state->hit_set_map.crend();
+               ++iter) {
+            if (iter->second->contains(soid)) {
+              is_hot = true;
+              break;
+            }
+          }
+        }
+        dout(20) << "OP_ISHOT " << oi.soid << " is_hot=" << is_hot << dendl;
+
+        bool archived = false;
+        bool deduped = false;
+        if (obs.oi.has_manifest() && obs.oi.manifest.is_chunked()) {
+          // scan chunk info whose offset is 0
+          // if the chunk's name is same with current obs, it's archived
+          auto p = obs.oi.manifest.chunk_map.find(0);
+          if (p != obs.oi.manifest.chunk_map.end() &&
+              obs.oi.soid.oid.name == obs.oi.manifest.chunk_map[0].oid.oid.name) {
+            dout(20) << obs.oi.soid.oid.name << " is archived" << dendl;
+            archived = true;
+          }
+
+          // if is not archived, and has multiple chunk info, it's deduped
+          if (!archived && obs.oi.manifest.chunk_map.size() > 0) {
+            dout(20) << obs.oi.soid.oid.name << " is deduped" << dendl;
+            deduped = true;
+          }
+        }
+
+        encode(is_hot, osd_op.outdata);
+        encode(archived, osd_op.outdata);
+        encode(deduped, osd_op.outdata);
+        result = 0;
       }
       break;
 
@@ -14698,15 +14763,25 @@ void PrimaryLogPG::hit_set_in_memory_trim(uint32_t max_in_memory)
 void PrimaryLogPG::agent_setup()
 {
   ceph_assert(is_locked());
-  if (!is_active() ||
-      !is_primary() ||
-      state_test(PG_STATE_PREMERGE) ||
-      pool.info.cache_mode == pg_pool_t::CACHEMODE_NONE ||
-      pool.info.tier_of < 0 ||
-      !get_osdmap()->have_pg_pool(pool.info.tier_of)) {
-    agent_clear();
-    return;
+  if (pool.info.get_dedup_tier() > 0) {
+    if (!is_active() ||
+        !is_primary() ||
+        state_test(PG_STATE_PREMERGE)) {
+      agent_clear();
+      return;
+    }
+  } else {
+    if (!is_active() ||
+        !is_primary() ||
+        state_test(PG_STATE_PREMERGE) ||
+        pool.info.cache_mode == pg_pool_t::CACHEMODE_NONE ||
+        pool.info.tier_of < 0 ||
+        !get_osdmap()->have_pg_pool(pool.info.tier_of)) {
+      agent_clear();
+      return;
+    }
   }
+
   if (!agent_state) {
     agent_state.reset(new TierAgentState);
 
@@ -14750,6 +14825,11 @@ bool PrimaryLogPG::agent_work(int start_max, int agent_flush_quota)
 
   if (agent_state->is_idle()) {
     dout(10) << __func__ << " idle, stopping" << dendl;
+    return true;
+  }
+
+  if (pool.info.get_dedup_tier() > 0) {
+    dout(20) << __func__ << " dedup tier, stopping" << dendl;
     return true;
   }
 
@@ -15155,6 +15235,10 @@ bool PrimaryLogPG::agent_choose_mode(bool restart, OpRequestRef op)
   if (agent_state->delaying) {
     dout(20) << __func__ << " " << this << " delaying, ignored" << dendl;
     return requeued;
+  }
+
+  if (pool.info.get_dedup_tier() > 0) {
+    agent_state->evict_mode = TierAgentState::EVICT_MODE_SOME;
   }
 
   TierAgentState::flush_mode_t flush_mode = TierAgentState::FLUSH_MODE_IDLE;

@@ -376,6 +376,16 @@ void librados::ObjectReadOperation::is_dirty(bool *is_dirty, int *prval)
   o->is_dirty(is_dirty, prval);
 }
 
+void librados::ObjectReadOperation::is_hot(bool *is_hot,
+                                           bool *archived,
+                                           bool *deduped,
+                                           int *prval)
+{
+  ceph_assert(impl);
+  ::ObjectOperation *o = &impl->o;
+  o->is_hot(is_hot, archived, deduped, prval);
+}
+
 int librados::IoCtx::omap_get_vals(const std::string& oid,
                                    const std::string& orig_start_after,
                                    const std::string& filter_prefix,

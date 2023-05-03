@@ -8347,9 +8347,7 @@ int OSDMonitor::prepare_command_pool_set(const cmdmap_t& cmdmap,
   }
 
   if (!p.is_tier() &&
-      (var == "hit_set_type" || var == "hit_set_period" ||
-       var == "hit_set_count" || var == "hit_set_fpp" ||
-       var == "target_max_objects" || var == "target_max_bytes" ||
+      (var == "target_max_objects" || var == "target_max_bytes" ||
        var == "cache_target_full_ratio" || var == "cache_target_dirty_ratio" ||
        var == "cache_target_dirty_high_ratio" || var == "use_gmt_hitset" ||
        var == "cache_min_flush_age" || var == "cache_min_evict_age" ||
