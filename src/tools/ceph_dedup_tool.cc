@@ -187,6 +187,7 @@ po::options_description make_usage() {
     ("daemon", ": execute sample dedup in daemon mode")
     ("loop", ": execute sample dedup in a loop until terminated. Sleeps 'wakeup-period' seconds between iterations")
     ("wakeup-period", po::value<int>(), ": set the wakeup period of crawler thread (sec)")
+    ("fpmap-capacity", po::value<uint32_t>(), ": set the maximum capacity of fingerprint map (byte)")
   ;
   desc.add(op_desc);
   return desc;
@@ -570,17 +571,45 @@ public:
       return cur_reference >= dedup_threshold && dedup_threshold != -1;
     }
 
+    uint32_t evict_entries() {
+      uint32_t num_evicts = 0;
+      for (auto iter = fp_map.cbegin(); iter != fp_map.cend();) {
+        if (iter->second < dedup_threshold) {
+          fp_map.erase(iter++);
+          ++num_evicts;
+        } else {
+          ++iter;
+        }
+      }
+      return num_evicts;
+    }
+
+    void check_map_size() {
+      uint32_t cur_capacity = fp_map.size()
+        * (sizeof(fp_map.begin()->first) + sizeof(fp_map.begin()->second));
+
+      if (fpmap_capacity <= cur_capacity) {
+        uint32_t num_evicts = evict_entries();
+        cout << "current fpmap size: " << cur_capacity << " exceeds default("
+          << fpmap_capacity << "). evicts " << num_evicts << " entries" << std::endl;
+      }
+      cout << "current fpmap size: " << cur_capacity << " is still affordable("
+        << fpmap_capacity << ")" << std::endl;
+    }
+
     void init(size_t dedup_threshold_) {
       std::unique_lock lock(fingerprint_lock);
       fp_map.clear();
       dedup_threshold = dedup_threshold_;
     }
-    FpStore(size_t chunk_threshold) : dedup_threshold(chunk_threshold) { }
+    FpStore(size_t chunk_threshold, uint32_t capacity)
+      : dedup_threshold(chunk_threshold), fpmap_capacity(capacity) { }
 
   private:
     ssize_t dedup_threshold = -1;
     std::unordered_map<std::string, dup_count_t> fp_map;
     std::shared_mutex fingerprint_lock;
+    uint32_t fpmap_capacity;
   };
 
   struct SampleDedupGlobal {
@@ -588,8 +617,9 @@ public:
     const double sampling_ratio = -1;
     SampleDedupGlobal(
       int chunk_threshold,
-      int sampling_ratio) :
-      fp_store(chunk_threshold),
+      int sampling_ratio,
+      uint32_t fpmap_capacity) :
+      fp_store(chunk_threshold, fpmap_capacity),
       sampling_ratio(static_cast<double>(sampling_ratio) / 100) { }
   };
 
@@ -677,6 +707,8 @@ void SampleDedupWorkerThread::crawl()
         try_dedup_and_accumulate_result(target, archived, deduped);
       }
     }
+
+    sample_dedup_global.fp_store.check_map_size();
   }
 
   vector<AioCompRef> evict_completions(oid_for_evict.size());
@@ -1660,6 +1692,12 @@ int make_crawling_daemon(const po::variables_map &opts)
   } else {
     cout << "100 second is set as wakeup period by default" << std::endl;
   }
+  uint32_t fpmap_capacity = 100000000;
+  if (opts.count("fpmap-capacity")) {
+    fpmap_capacity = opts["fpmap-capacity"].as<uint32_t>();
+  } else {
+    cout << "1GB is set as fpmap capacity by default" << std::endl;
+  }
 
   std::string fp_algo = get_opts_fp_algo(opts);
 
@@ -1732,7 +1770,7 @@ int make_crawling_daemon(const po::variables_map &opts)
     }
 
     SampleDedupWorkerThread::SampleDedupGlobal sample_dedup_global(
-      chunk_dedup_threshold, sampling_ratio);
+      chunk_dedup_threshold, sampling_ratio, fpmap_capacity);
 
     std::list<SampleDedupWorkerThread> threads;
     for (unsigned i = 0; i < max_thread; i++) {
