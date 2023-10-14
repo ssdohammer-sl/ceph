@@ -1685,6 +1685,162 @@ int make_crawling_daemon(const po::variables_map &opts)
   return 0;
 }
 
+class ConcurrentSetChunkThread : public Thread
+{
+public:
+  ConcurrentSetChunkThread(int _id, IoCtx _ioctx, IoCtx _chunk_ioctx,
+                           int _objs_per_thread, int _output_interval) :
+    id(_id), ioctx(_ioctx), chunk_ioctx(_chunk_ioctx),
+    objs_per_thread(_objs_per_thread),
+    output_interval(_output_interval) {}
+  virtual ~ConcurrentSetChunkThread() override {}
+
+protected:
+  void* entry() override {
+    bufferlist zerodata;
+    for (int i = 0; i < 10; ++i) {
+      zerodata.append("0000000000");
+    }
+    // write metadata objects
+    for(int i = 0; i < objs_per_thread; ++i) {
+      ObjectWriteOperation wop;
+      wop.write_full(zerodata);
+      ioctx.operate("foo_" + to_string(id) + "_" + to_string(i), &wop);
+    }
+    cout << "thread " << id << " " << objs_per_thread << " object write done" << std::endl;
+
+    string fp = crypto::digest<crypto::SHA1>(zerodata).to_str();
+    for (int i = 0; i < objs_per_thread; ++i) {
+      // check radods lock
+      //int ret = chunk_ioctx.lock_exclusive(fp, "set-chunk-lock", "", "", NULL, 0);
+      //cout << "excl lock ret: " << ret << std::endl;
+      //if (ret < 0) {
+        //continue;
+      //}
+
+      ObjectReadOperation op;
+      op.set_chunk(0, 100, chunk_ioctx, fp, 0, CEPH_OSD_OP_FLAG_WITH_REFERENCE);
+      chrono::steady_clock::time_point start = chrono::steady_clock::now();
+      ioctx.operate("foo_" + to_string(id) + "_" + to_string(i), &op, nullptr);
+      chrono::steady_clock::time_point end = chrono::steady_clock::now();
+
+      //chunk_ioctx.unlock(fp, "set-chunk-lock", "");
+      //cout << "excl unlock" << std::endl;
+
+      if (id == 0 && i % output_interval == 0) {
+        chrono::duration<double> sec = end - start;
+        cout << "foo_" << id << "_" << i << "," << sec.count() << std::endl;
+      }
+    }
+    return nullptr;
+  }
+
+  int id;
+  IoCtx ioctx;
+  IoCtx chunk_ioctx;
+  int objs_per_thread;
+  int output_interval;
+};
+
+int test_concurrent_set_chunk(const po::variables_map &opts)
+{
+  unsigned max_thread = get_opts_max_thread(opts);
+  string base_pool_name = get_opts_pool_name(opts);
+  string chunk_pool_name = get_opts_chunk_pool(opts);
+  cout << "base pool name: " << base_pool_name << ", chunk pool name: "
+       << chunk_pool_name << std::endl;
+  size_t chunk_size = 1024;
+  if (opts.count("chunk-size")) {
+    chunk_size = opts["chunk-size"].as<int>();
+  } else {
+    cout << "1024 is set as chunk size by default" << std::endl;
+  }
+
+  Rados rados;
+  int ret = rados.init_with_context(g_ceph_context);
+  if (ret < 0) {
+    cerr << "couldn't initialize rados: " << cpp_strerror(ret) << std::endl;
+    return -EINVAL;
+  }
+  ret = rados.connect();
+  if (ret) {
+    cerr << "couldn't connect to cluster: " << cpp_strerror(ret) << std::endl;
+    return -EINVAL;
+  }
+
+  IoCtx io_ctx, chunk_io_ctx;
+  ret = rados.ioctx_create(base_pool_name.c_str(), io_ctx);
+  if (ret < 0) {
+    cerr << "error opening base pool "
+      << base_pool_name << ": "
+      << cpp_strerror(ret) << std::endl;
+    return -EINVAL;
+  }
+  ret = rados.ioctx_create(chunk_pool_name.c_str(), chunk_io_ctx);
+  if (ret < 0) {
+    cerr << "error opening chunk pool "
+      << chunk_pool_name << ": "
+      << cpp_strerror(ret) << std::endl;
+    return -EINVAL;
+  }
+  bufferlist inbl;
+  string fp_algo = "sha1";
+  ret = rados.mon_command(
+      make_pool_str(base_pool_name, "fingerprint_algorithm", fp_algo),
+      inbl, NULL, NULL);
+  if (ret < 0) {
+    cerr << " operate fail : " << cpp_strerror(ret) << std::endl;
+    return ret;
+  }
+  string chunk_algo = "fixed";
+  ret = rados.mon_command(
+      make_pool_str(base_pool_name, "dedup_chunk_algorithm", chunk_algo),
+      inbl, NULL, NULL);
+  if (ret < 0) {
+    cerr << " operate fail : " << cpp_strerror(ret) << std::endl;
+    return ret;
+  }
+  ret = rados.mon_command(
+      make_pool_str(base_pool_name, "dedup_cdc_chunk_size", chunk_size),
+      inbl, NULL, NULL);
+  if (ret < 0) {
+    cerr << " operate fail : " << cpp_strerror(ret) << std::endl;
+    return ret;
+  }
+  
+  bufferlist zerodata;
+  for (int i = 0; i < 10; ++i) {
+    zerodata.append("0000000000");
+  }
+  ObjectWriteOperation wop;
+  string fp = crypto::digest<crypto::SHA1>(zerodata).to_str();
+  wop.write_full(zerodata);
+  chunk_io_ctx.operate(fp, &wop);
+  cout << "Write chunk object " << fp << "  done" << std::endl;
+
+  int objs_per_thread = 1024 * 100 / max_thread;
+  int output_interval = 64 / max_thread;
+  list<ConcurrentSetChunkThread> threads;
+  for (unsigned int i = 0; i < max_thread; ++i) {
+    threads.emplace_back(i, io_ctx, chunk_io_ctx, objs_per_thread, output_interval);
+    //threads.back().create("test-set-chunk");
+    //cout << "ConcurrentSetChunkThread created" << std::endl;
+  }
+  cout << max_thread << " threads are created" << std::endl;
+  cout << "each thread will handle " << objs_per_thread << " metadata objects" << std::endl;
+
+  for (auto& p : threads) {
+    p.create("test-set-chunk");
+  }
+
+  for (auto& p : threads) {
+    p.join();
+  }
+  cout << "Concurrent set-chunk test done" << std::endl;
+
+  return 0;
+}
+
 int main(int argc, const char **argv)
 {
   auto args = argv_to_vec(argc, argv);
@@ -1766,6 +1922,8 @@ int main(int argc, const char **argv)
     ret = make_dedup_object(opts);
   } else if (op_name == "sample-dedup") {
     ret = make_crawling_daemon(opts);
+  } else if (op_name == "concurrent-set-chunk") {
+    ret = test_concurrent_set_chunk(opts);
   } else {
     cerr << "unrecognized op " << op_name << std::endl;
     exit(1);
