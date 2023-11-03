@@ -716,6 +716,7 @@ int make_crawling_daemon(const po::variables_map &opts)
       return -EINVAL;
     }
 
+    ceph_assert(d_opts.get_sampling_ratio() >= 0);
     SampleDedupWorkerThread::SampleDedupGlobal sample_dedup_global(
       d_opts.get_chunk_dedup_threshold(), d_opts.get_sampling_ratio(),
       d_opts.get_report_period(), d_opts.get_fp_threshold());
