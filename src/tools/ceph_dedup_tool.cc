@@ -129,6 +129,9 @@ struct EstimateResult {
 };
 
 map<uint64_t, EstimateResult> dedup_estimates;  // chunk size -> result
+vector<uint32_t> obj_size_pool;
+ceph::mutex osv_lock = ceph::make_mutex("objlock");
+
 
 using namespace librados;
 unsigned default_op_size = 1 << 26;
@@ -253,6 +256,7 @@ class EstimateDedupRatio : public CrawlerThread
   string fp_algo;
   uint64_t chunk_size;
   uint64_t max_seconds;
+  vector<uint32_t> obj_size_thread;
 
 public:
   EstimateDedupRatio(
@@ -414,6 +418,10 @@ void EstimateDedupRatio::estimate_dedup_ratio()
       examined_objects++;
       examined_bytes += bl.length();
 
+      //cout << "obj: " << oid << ", len: " << bl.length() << std::endl;
+      obj_size_thread.emplace_back(bl.length());
+
+      /*
       // do the chunking
       for (auto& i : dedup_estimates) {
 	vector<pair<uint64_t, uint64_t>> chunks;
@@ -428,8 +436,13 @@ void EstimateDedupRatio::estimate_dedup_ratio()
 	}
 	++i.second.total_objects;
       }
+      */
     }
   }
+
+  osv_lock.lock();
+  obj_size_pool.insert(obj_size_pool.end(), obj_size_thread.begin(), obj_size_thread.end());
+  osv_lock.unlock();
 }
 
 static void print_chunk_scrub();
@@ -943,6 +956,7 @@ void SampleDedupWorkerThread::try_dedup_and_accumulate_result(
 	 << " read returned size 0" << std::endl;
     return;
   }
+  ///*
   auto chunks = do_cdc(object, data);
   size_t chunk_total_amount = 0;
 
@@ -957,9 +971,11 @@ void SampleDedupWorkerThread::try_dedup_and_accumulate_result(
 	 << std::endl;
     return;
   }
+  //*/
 
   size_t duplicated_size = 0;
   list<chunk_t> redundant_chunks;
+  ///*
   for (auto &chunk : chunks) {
     auto &chunk_data = std::get<0>(chunk);
     std::string fingerprint = generate_fingerprint(chunk_data);
@@ -979,8 +995,19 @@ void SampleDedupWorkerThread::try_dedup_and_accumulate_result(
       redundant_chunks.push_back(chunk_info);
     }
   }
+  //*/
 
   size_t object_size = data.length();
+  /*
+  chunk_t chunk_info = {
+    .oid = object.oid,
+    .start = 0,
+    .size = object_size,
+    .fingerprint = object.oid,
+    .data = data
+    };
+  redundant_chunks.emplace_back(chunk_info);
+  */
 
   // perform chunk-dedup
   for (auto &p : redundant_chunks) {
@@ -1200,6 +1227,15 @@ int estimate_dedup_ratio(const po::variables_map &opts)
   list<string> pool_names;
   map<string, librados::pool_stat_t> stats;
 
+  double sum, mean, sq_sum, size_stdev;
+  uint64_t min_size = 999999999;
+  uint64_t max_size = 0;
+  vector<double> diff;
+
+  uint32_t interval;
+  vector<uint32_t> aligned;
+  vector<uint32_t> misaligned;
+
   pool_name = get_opts_pool_name(opts);
   if (opts.count("chunk-algorithm")) {
     chunk_algo = opts["chunk-algorithm"].as<string>();
@@ -1211,6 +1247,7 @@ int estimate_dedup_ratio(const po::variables_map &opts)
     cerr << "must specify chunk-algorithm" << std::endl;
     exit(1);
   }
+  ///*
   fp_algo = get_opts_fp_algo(opts);
   if (opts.count("chunk-size")) {
     chunk_size = opts["chunk-size"].as<int>();
@@ -1241,6 +1278,7 @@ int estimate_dedup_ratio(const po::variables_map &opts)
     debug = true;
   }
   boost::optional<pg_t> pgid(opts.count("pgid"), pg_t());
+  //*/
 
   ret = rados.init_with_context(g_ceph_context);
   if (ret < 0) {
@@ -1265,6 +1303,7 @@ int estimate_dedup_ratio(const po::variables_map &opts)
     goto out;
   }
 
+  /*
   // set up chunkers
   if (chunk_size) {
     dedup_estimates.emplace(std::piecewise_construct,
@@ -1277,6 +1316,7 @@ int estimate_dedup_ratio(const po::variables_map &opts)
 			      std::forward_as_tuple(chunk_algo, cbits(cs)-1));
     }
   }
+  */
 
   glock.lock();
   begin = io_ctx.object_list_begin();
@@ -1312,6 +1352,61 @@ int estimate_dedup_ratio(const po::variables_map &opts)
   }
 
   print_dedup_estimate(cout, chunk_algo);
+
+  // calculate object size statistics
+  sum = accumulate(obj_size_pool.begin(), obj_size_pool.end(), 0.0);
+  mean = sum / obj_size_pool.size();
+
+  diff.resize(obj_size_pool.size());
+  transform(obj_size_pool.begin(), obj_size_pool.end(), diff.begin(), [mean](double x) {return x - mean;});
+  sq_sum = inner_product(diff.begin(), diff.end(), diff.begin(), 0.0);
+  size_stdev = sqrt(sq_sum / obj_size_pool.size());
+
+  for (auto& i : obj_size_pool) {
+    if (i < min_size && i > 0) {
+      min_size = i;
+    }
+    if (i > max_size) {
+      max_size = i;
+    }
+  }
+  //min_size = *min_element(obj_size_pool.begin(), obj_size_pool.end());
+  //max_size = *max_element(obj_size_pool.begin(), obj_size_pool.end())
+
+  cout << "total objs count: " << obj_size_pool.size() << std::endl;
+  cout << "total obj size: " << sum << std::endl;
+  cout << "avg obj size: " << mean << std::endl;
+  cout << "stdev: " << size_stdev << std::endl;
+  cout << "min obj size: " << min_size << std::endl;
+  cout << "max obj size: " << max_size << std::endl;
+
+  cout << "object size specification starts" << std::endl;
+  aligned.assign(10, 0);
+  misaligned.assign(10, 0);
+
+  interval = (max_size - min_size) / 10;
+  cout << "interval: " << interval << std::endl;
+  for (auto& i : obj_size_pool) {
+    if (i <= 0) {
+      continue;
+    }
+    uint32_t section = (i - min_size) / interval;
+    if (section == 10) {
+      section--;
+    }
+    if (i % 4096 == 0) {
+      aligned[section]++;
+      //cout << section << " aligned" << std::endl;
+    } else {
+      misaligned[section]++;
+      //cout << section << " misaligned"  << std::endl;
+    }
+  }
+
+  cout << "aligned, unaligned" << std::endl;
+  for (int i = 0; i < 10; i++) {
+    cout << aligned[i] << ", " << misaligned[i] << std::endl;
+  }
 
  out:
   return (ret < 0) ? 1 : 0;
@@ -1903,6 +1998,45 @@ int make_crawling_daemon(const po::variables_map &opts)
   return 0;
 }
 
+int test_obj_size(const po::variables_map &opts)
+{
+  string pool_name = get_opts_pool_name(opts);
+  cout << "pool name: " << pool_name << std::endl;
+
+  Rados rados;
+  int ret = rados.init_with_context(g_ceph_context);
+  if (ret < 0) {
+    cerr << "couldn't initialize rados: " << cpp_strerror(ret) << std::endl;
+    return -EINVAL;
+  }
+  ret = rados.connect();
+  if (ret) {
+    cerr << "couldn't connect to cluster: " << cpp_strerror(ret) << std::endl;
+    return -EINVAL;
+  }
+
+  IoCtx ioctx;
+  ret = rados.ioctx_create(pool_name.c_str(), ioctx);
+  if (ret < 0) {
+    cerr << "Error opening test pool: " << cpp_strerror(ret) << std::endl;
+    return -EINVAL;
+  }
+
+  // write random data
+  default_random_engine gen;
+  bufferlist bl;
+  generate_buffer(10 * 1024 * 1024, &bl, clock());
+
+  ObjectWriteOperation wop;
+  wop.write_full(bl);
+  if (ioctx.operate("randobj", &wop) != 0) {
+    cerr << "Error write 100MB random object: " << cpp_strerror(ret) << std::endl;
+    return -EINVAL;
+  }
+
+  return 0;
+}
+
 int main(int argc, const char **argv)
 {
   auto args = argv_to_vec(argc, argv);
@@ -1984,6 +2118,8 @@ int main(int argc, const char **argv)
     ret = make_dedup_object(opts);
   } else if (op_name == "sample-dedup") {
     ret = make_crawling_daemon(opts);
+  } else if (op_name == "obj-size-test") {
+    ret = test_obj_size(opts);
   } else {
     cerr << "unrecognized op " << op_name << std::endl;
     exit(1);
