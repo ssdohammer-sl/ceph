@@ -65,6 +65,19 @@ struct EstimateResult {
     return fp;
   }
 
+  vector<string> get_fps(bufferlist& obj,
+      const vector<pair<uint64_t, uint64_t>>& chunk_ranges,
+      const string fp_algo) {
+    vector<string> fps;
+    for (auto& r : chunk_ranges) {
+      bufferlist chunk;
+      chunk.substr_of(obj, r.first, r.second);
+      fps.emplace_back(generate_fp(chunk, fp_algo));
+      add_chunk(chunk, fp_algo);
+    }
+    return fps;
+  }
+
   void dump(Formatter *f) const {
     f->dump_unsigned("target_chunk_size", chunk_size);
 
@@ -148,6 +161,9 @@ po::options_description make_usage() {
     ("pack-obj-size", po::value<uint64_t>(), ": pack object size (byte)")
     ("chunk-dedup-threshold", po::value<uint64_t>(), ": chunk dedup threshold")
     ("packer-type", po::value<std::string>(), ": type of object packer")
+    ("max-apo-entries", po::value<uint32_t>(), ": maximum number of ActivePackObject entries")
+    ("bit-vector-len", po::value<uint32_t>(), ": bit vector length of the bloom filter")
+    ("similarity-threshold", po::value<uint32_t>(), ": low threshold value of hamming similarity")
   ;
   desc.add(op_desc);
   return desc;
@@ -214,6 +230,12 @@ public:
 class Packer
 {
 protected:
+  enum class PackerType : unsigned int {
+    Simple = 1,
+    Heuristic,
+    None 
+  } type;
+
   // Accessed in the estimate threads under fpmap_lock
   // <fp_value, <count, pack object id>>
   unordered_map<string, pair<uint32_t, int>> fp_store;
@@ -229,7 +251,7 @@ public:
       debug(debug) {}
   virtual ~Packer() {}
 
-  virtual string pack(string fp, int chunk_size, string src_oid) = 0;
+  virtual int pack(string fp, int chunk_size, string src_oid, int* poid = nullptr) = 0;
 
   void add(string fp) {
     unique_lock l{fpmap_lock};
@@ -254,18 +276,31 @@ public:
   }
 
   bool check_packed(string fp, int& oid) {
+    shared_lock l{fpmap_lock};
     auto i = fp_store.find(fp);
+    l.unlock();
     if (i->second.second < 0) {
       return false;
     }
     oid = i->second.second;
     return true;
   }
+
+  string get_type() {
+    switch (type) {
+    case PackerType::Simple:
+      return "simple";
+    case PackerType::Heuristic:
+      return "heuristic";
+    default:
+      return "none";
+    }
+  }
 };
 
 class SimplePacker : public Packer
 {
-  int poid = 0; // pack object id
+  std::atomic<int> target_poid = 0; // pack object id
   uint64_t pack_obj_size = 0; // Accessed in the estimate threads under packing_lock
   ceph::shared_mutex packing_lock = ceph::make_shared_mutex("packing lock");
 
@@ -274,16 +309,20 @@ class SimplePacker : public Packer
 
 public:
   SimplePacker(uint64_t max_packobj_size, uint32_t dedup_threshold, bool debug)
-    : Packer(max_packobj_size, dedup_threshold, debug) {}
+    : Packer(max_packobj_size, dedup_threshold, debug) {
+      type = PackerType::Simple;
+    }
   virtual ~SimplePacker() {}
 
-  string pack(string fp, int chunk_size, string src_oid) override {
+  virtual int pack(string fp, int chunk_size, string src_oid, int* poid = nullptr) override {
+    assert(*poid < 0);
+
     unique_lock pl(packing_lock);
     // check if fp is packed
     int chunk_poid = -1;
     if (check_packed(fp, chunk_poid)) {
       pl.unlock();
-      return to_string(chunk_poid);
+      return chunk_poid;
     }
 
     if (pack_obj_size >= max_packobj_size) {
@@ -291,11 +330,11 @@ public:
         cerr << "pack object info. size: " << pack_obj_size << std::endl;
         cerr << "new pack object created" << std::endl;
       }
-      poid++;
+      target_poid++;
       pack_obj_size = 0;
       active_packobj.clear();
     }
-    chunk_poid = poid;
+    chunk_poid = target_poid;
     pack_obj_size += chunk_size;
     active_packobj.emplace_back(make_pair(fp, src_oid));
     pl.unlock();
@@ -304,8 +343,155 @@ public:
     auto entry = fp_store.find(fp);
     entry->second.second = chunk_poid;
     fl.unlock();
+    return chunk_poid;
+  }
+};
 
-    return to_string(chunk_poid);
+class HeuristicPacker : public Packer
+{
+public:
+  std::atomic<int> poid_idx = 0;
+  uint32_t max_apo_entries = 0;
+  map<int, pair<bloom_filter, uint64_t>> active_pack_objs;
+  ceph::shared_mutex apo_lock = ceph::make_shared_mutex("apo lock");
+
+  uint32_t bv_len;
+  uint32_t similarity_threshold;
+
+public:
+  HeuristicPacker(uint64_t max_packobj_size, uint32_t dedup_threshold,
+      bool debug, uint32_t max_apo_entries, uint32_t bv_len,
+      uint32_t similarity_threshold)
+    : Packer(max_packobj_size, dedup_threshold, debug),
+      max_apo_entries(max_apo_entries), bv_len(bv_len),
+      similarity_threshold(similarity_threshold) {
+      type = PackerType::Heuristic;
+    }
+  virtual ~HeuristicPacker() {}
+
+  virtual int pack(string fp, int chunk_size, string src_oid, int* poid = nullptr) override {
+    // check if fp is packed
+    int chunk_poid = -1;
+    if (check_packed(fp, chunk_poid)) {
+      return chunk_poid;
+    }
+
+    int target_poid = *poid;
+    unique_lock al(apo_lock);
+    if (active_pack_objs.find(target_poid) == active_pack_objs.end()) {
+      //cout << "!!!!! fp: " << fp << ", poid: " << target_poid << " created" << std::endl;
+      active_pack_objs.emplace(target_poid,
+          make_pair(generate_bf(vector<string>(), chunk_size), 0));
+      cout << "bit vector length: " << active_pack_objs[target_poid].first.size() / CHAR_BIT << ", num elements: " << active_pack_objs[target_poid].first.element_count() << std::endl;
+      ++poid_idx;
+    }
+    pair<bloom_filter, uint64_t>& apo_entry = active_pack_objs[target_poid];
+    // target pack object is full
+    if (apo_entry.second >= max_packobj_size) {
+      active_pack_objs.erase(target_poid);
+      al.unlock();
+      return -EAGAIN;
+    }
+
+    // update apo entry
+    apo_entry.first.insert(fp);
+    apo_entry.second += chunk_size;
+    al.unlock();
+
+    unique_lock fl(fpmap_lock);
+    auto fp_entry = fp_store.find(fp);
+    ceph_assert(fp_entry != fp_store.end());
+    fp_entry->second.second = target_poid;
+    fl.unlock();
+    return target_poid;
+  }
+
+  bloom_filter generate_bf(const vector<string>& fps, uint64_t chunk_size) {
+    uint64_t expected_cnt = max_packobj_size / chunk_size;
+    bloom_filter bf(1, bv_len, 0, expected_cnt * 10);
+    for (auto& fp : fps) {
+      bf.insert(fp);
+    }
+    return bf;
+  }
+
+  uint32_t get_hamming_similarity(bloom_filter& mo_bf, bloom_filter& entry_bf) {
+    uint32_t score = 0;
+    // bit-vector of the metadata object
+    const unsigned char* mo_bv = mo_bf.table();
+    // bit-vector of the APO entry
+    const unsigned char* entry_bv = entry_bf.table();
+
+    for (uint32_t i = 0; i < mo_bf.size() / CHAR_BIT; ++i) {
+      unsigned char common_bits = mo_bv[i] &  entry_bv[i];
+      // count set bits
+      while (common_bits) {
+        score += common_bits & 1;
+        common_bits >>= 1;
+      }
+    }
+    return score;
+  }
+
+  uint32_t get_similarity(vector<string>& mo_fps, bloom_filter& entry_bf) {
+    uint32_t score = 0;
+    for (auto& fp : mo_fps) {
+      if (entry_bf.contains(fp)) {
+        ++score;
+      }
+    }
+    return score;
+  }
+
+  int get_similar_poid(bloom_filter& mo_bf, uint64_t chunk_size) {
+    int target_poid = -1;
+    uint32_t max_score = 0;
+    int min_size_poid = -1;
+    int min_po_size = INT_MAX;
+
+    unique_lock al(apo_lock);
+    if (active_pack_objs.empty()) {
+      target_poid = poid_idx;
+      al.unlock();
+      return target_poid;
+    }
+
+    // find the most similar pack object
+    for (auto& kv : active_pack_objs) {
+      if (kv.second.second <= 0) {
+        continue;
+      }
+      bloom_filter& po_bf = kv.second.first;
+      uint32_t score = get_hamming_similarity(mo_bf, po_bf);
+      int poid = kv.first;
+      if (score > max_score) {
+        max_score = score;
+        target_poid = poid;
+      }
+
+      // update minimum pack object size just in case of similarity not found
+      int po_size = kv.second.second;
+      if (po_size < min_po_size) {
+        min_po_size = po_size;
+        min_size_poid = poid;
+      }
+    }
+    //cout << "max score: " << max_score << std::endl;
+
+    // similarity not found
+    if (max_score < similarity_threshold) {
+      cout << "similarity not found" << std::endl;
+
+      // APO entries full. append to smallest pack object
+      if (active_pack_objs.size() >= max_apo_entries) {
+        cout << "apo map full. " << min_size_poid << " is selected" << std::endl;
+        target_poid = min_size_poid;
+      } else {
+        target_poid = poid_idx;
+      }
+    }
+    al.unlock();
+    return target_poid;
   }
 };
 
@@ -1370,58 +1556,79 @@ public:
         bufferlist bl;
         uint64_t offset = 0;
         while (true) {
-    bufferlist t;
-    int ret = io_ctx.read(oid, t, op_size, offset);
-    if (ret <= 0) {
-      break;
-    }
-    offset += ret;
-    bl.claim_append(t);
+  bufferlist t;
+  int ret = io_ctx.read(oid, t, op_size, offset);
+  if (ret <= 0) {
+    break;
+  }
+  offset += ret;
+  bl.claim_append(t);
         }
         examined_objects++;
         examined_bytes += bl.length();
 
-        // do the chunking
-        for (auto& i : dedup_estimates) {
-    vector<pair<uint64_t, uint64_t>> chunks;
-    set<string> pack_objs;
-    i.second.cdc->calc_chunks(bl, &chunks);
-    uint32_t deduped = 0;
-    uint32_t not_deduped = 0;
-    for (auto& p : chunks) {
-      bufferlist chunk;
-      chunk.substr_of(bl, p.first, p.second);
-      i.second.add_chunk(chunk, fp_algo);
+        auto est = dedup_estimates.find(chunk_size);
+        if (est == dedup_estimates.end()) {
+  cerr << "dedup estimate result set error" << std::endl;
+        }
 
-      // if chunk is duplicated enough, do packing
-      string fp_value = i.second.generate_fp(chunk, fp_algo);
-      packer->add(fp_value);
+        vector<pair<uint64_t, uint64_t>> chunks;
+        set<string> pack_objs;  // for estimating fragmetation ratio
+        // do chunking
+        est->second.cdc->calc_chunks(bl, &chunks);
+        bloom_filter mo_bf;
 
-      //string src_oid;
-      if (packer->check_duplicated(fp_value)) {
-        // add pack object id where chunk object is stored
-        string poid = packer->pack(fp_value, p.second, oid);
-        pack_objs.emplace(poid);
-        deduped++;
-      } else {
-        // add metadata object oid for not duplicated chunk
-        not_deduped++;
+        vector<string> fps = est->second.get_fps(bl, chunks, fp_algo);
+        int poid = -1;  // only for heuristic packing
+        if (packer->get_type() == "heuristic") {
+  mo_bf
+    = static_cast<HeuristicPacker*>(packer.get())->generate_bf(fps, chunk_size);
+
+  poid
+    = static_cast<HeuristicPacker*>(packer.get())->get_similar_poid(mo_bf, chunk_size);
+        }
+        //cout << "moid: " << oid << ", poid: " << poid << ", apo size: " << static_cast<HeuristicPacker*>(packer.get())->active_pack_objs.size() << std::endl;
+
+        uint32_t deduped = 0;
+        uint32_t not_deduped = 0;
+        for (uint32_t i = 0; i < fps.size(); ++i) {
+  string fp = fps[i];
+  uint64_t chunk_len = chunks[i].second;
+  packer->add(fp);
+
+  // if chunk is duplicated enough, do packing (dedup)
+  if (packer->check_duplicated(fp)) {
+    int packed_oid = packer->pack(fp, chunk_len, oid, &poid);
+    while (packed_oid == -EAGAIN) {
+      cout << "oid: " << oid << " calculate again" << std::endl;
+      // recalculate target pack object and retry packing if po pull
+      if (packed_oid == -EAGAIN && packer->get_type() == "heuristic") {
+        poid
+          = static_cast<HeuristicPacker*>(packer.get())->get_similar_poid(mo_bf, chunk_size);
+        packed_oid = packer->pack(fp,chunk_len, oid, &poid);
       }
     }
-    ++i.second.total_objects;
 
-    if (debug) {
-      cerr << oid << " needs " << pack_objs.size()
-        << " read ops to restore data" << std::endl;
-      cerr << deduped << " deduped, " << not_deduped << " not deduped" << std::endl;
-    }
+    pack_objs.emplace(to_string(packed_oid));
+    deduped++;
+  } else {
+    // add metadata object oid for not duplicated chunk
+    not_deduped++;
+  }
+        }
+        ++(est->second.total_objects);
 
-    // update packing metrics
-    if (pack_objs.size() > 1) {
-      required_read_ops += pack_objs.size();
-      num_deduped_metaobjs++;
-      num_deduped_chunks += deduped;
-    }
+        if (debug) {
+  cerr << est->second.total_objects << " " << oid << " needs " << pack_objs.size()
+    << " read ops to restore data" << std::endl;
+  cerr << deduped << " deduped, " << not_deduped << " not deduped" << std::endl;
+        }
+
+        // update packing metrics
+        if (pack_objs.size() > 0) {
+  required_read_ops += pack_objs.size();
+  num_deduped_metaobjs++;
+  num_deduped_chunks += deduped;
         }
       }
     }
@@ -1439,7 +1646,7 @@ int estimate_fragmentation(const po::variables_map &opts)
   IoCtx io_ctx;
   int ret;
 
-  uint64_t pack_obj_size = 64;   // default 64MB
+  uint64_t pack_obj_size = 64 * 1024 * 1024;   // default 64MB
   if (opts.count("pack-obj-size")) {
     pack_obj_size = opts["pack-obj-size"].as<uint64_t>();
   }
@@ -1482,6 +1689,21 @@ int estimate_fragmentation(const po::variables_map &opts)
   string packer_type = "simple"; // default simple packing
   if (opts.count("packer-type")) {
     packer_type = opts["packer-type"].as<string>();
+  }
+
+  uint32_t max_apo_entries = 0; // default max apo entries
+  if (opts.count("max-apo-entries")) {
+    max_apo_entries = opts["max-apo-entries"].as<uint32_t>();
+  }
+
+  uint32_t bv_len = 32768;  // default bit vector length
+  if (opts.count("bit-vector-len")) {
+    bv_len = opts["bit-vector-len"].as<uint32_t>();
+  }
+
+  uint32_t similarity_threshold = 10; // default similarity threshold
+  if (opts.count("similarity-threshold")) {
+    similarity_threshold = opts["similarity-threshold"].as<uint32_t>();
   }
 
   ret = rados.init_with_context(g_ceph_context);
@@ -1533,10 +1755,15 @@ int estimate_fragmentation(const po::variables_map &opts)
   }
   librados::pool_stat_t s = stats[pool_name];
 
-  shared_ptr<SimplePacker> packer
-    = make_shared<SimplePacker>(pack_obj_size, dedup_threshold, debug);
+  shared_ptr<Packer> packer;
+  if (packer_type == "simple") {
+    packer = make_shared<SimplePacker>(pack_obj_size, dedup_threshold, debug);
+  } else {
+    packer = make_shared<HeuristicPacker>(pack_obj_size, dedup_threshold, debug,
+        max_apo_entries, bv_len, similarity_threshold);
+  }
 
-  for (int i = 0; i < num_threads; i++) {
+  for (int i = 0; i < num_threads; ++i) {
     std::unique_ptr<EstimateFragmentationRatio> ptr (
       new EstimateFragmentationRatio(io_ctx, i, num_threads, begin, end,
         chunk_algo, fp_algo, chunk_size, report_period, s.num_objects,
@@ -1550,8 +1777,10 @@ int estimate_fragmentation(const po::variables_map &opts)
   for (auto& p : estimate_threads) {
     p->join();
   }
+  cout << "all threads dead" << std::endl;
 
   print_dedup_estimate(cerr, chunk_algo);
+  cout << "print dedup estimate done" << std::endl;
   // print fragmentation info
   uint64_t total_read_ops = 0;
   uint64_t num_deduped_chunks= 0;
@@ -1564,11 +1793,14 @@ int estimate_fragmentation(const po::variables_map &opts)
     num_deduped_metaobjs
       += static_cast<EstimateFragmentationRatio*>(et.get())->get_num_deduped_metaobjs();
   }
+  cout << "num_deduped_metaobjs: " << num_deduped_metaobjs << std::endl;
   cerr << "read ops to get scanned metadata objs: " << total_read_ops << std::endl;
   cerr << "the number of packed chunks: " << num_deduped_chunks << std::endl;
   cerr << "the number of deduped metadata objs: " << num_deduped_metaobjs << std::endl;
   cerr << "avg read ops: " << total_read_ops / (double) num_deduped_metaobjs << std::endl;
 
+  bloom_filter tmp_bf(1, bv_len, 0, pack_obj_size / chunk_size * 10);
+  cerr << "bit vector size : " << tmp_bf.size() / CHAR_BIT << ", bloom_filter size: " << sizeof(tmp_bf) << std::endl;
 
   return 0;
 }
