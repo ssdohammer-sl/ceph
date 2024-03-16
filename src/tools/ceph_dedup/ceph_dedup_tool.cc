@@ -161,6 +161,9 @@ po::options_description make_usage() {
     ("pack-obj-size", po::value<uint64_t>(), ": pack object size (byte)")
     ("chunk-dedup-threshold", po::value<uint64_t>(), ": chunk dedup threshold")
     ("packer-type", po::value<std::string>(), ": type of object packer")
+    ("max-apo-entries", po::value<uint32_t>(), ": maximum number of ActivePackObject entries")
+    ("bit-vector-len", po::value<uint32_t>(), ": bit vector length of the bloom filter")
+    ("similarity-threshold", po::value<uint32_t>(), ": low threshold value of hamming similarity")
   ;
   desc.add(op_desc);
   return desc;
@@ -248,7 +251,7 @@ public:
       debug(debug) {}
   virtual ~Packer() {}
 
-  virtual int pack(string fp, int chunk_size, string src_oid) = 0;
+  virtual int pack(string fp, int chunk_size, string src_oid, int* poid = nullptr) = 0;
 
   void add(string fp) {
     unique_lock l{fpmap_lock};
@@ -285,16 +288,14 @@ public:
   }
 
   string get_type() {
-    string ret;
     switch(type) {
     case PackerType::Simple:
-      ret = "simple";
+      return "simple";
     case PackerType::Heuristic:
-      ret = "heuristic";
+      return "heuristic";
     default:
-      ret = "none";
+      return "none";
     }
-    return ret;
   }
 };
 
@@ -314,7 +315,9 @@ public:
     }
   virtual ~SimplePacker() {}
 
-  virtual int pack(string fp, int chunk_size, string src_oid) override {
+  virtual int pack(string fp, int chunk_size, string src_oid, int* poid = nullptr) override {
+    assert(*poid < 0);
+
     unique_lock pl(packing_lock);
     // check if fp is packed
     int chunk_poid = -1;
@@ -343,6 +346,151 @@ public:
     fl.unlock();
 
     return chunk_poid;
+  }
+};
+
+class HeuristicPacker : public Packer
+{
+public:
+  std::atomic<int> poid_idx = 0;
+  uint32_t max_apo_entries = 0;
+  map<int, pair<bloom_filter, uint64_t>> active_pack_objs;
+  ceph::shared_mutex apo_lock = ceph::make_shared_mutex("apo lock");
+
+  uint32_t bv_len;
+  uint32_t similarity_threshold;
+
+public:
+  HeuristicPacker(uint64_t max_packobj_size, uint32_t dedup_threshold,
+      bool debug, uint32_t max_apo_entries, uint32_t bv_len,
+      uint32_t similarity_threshold)
+    : Packer(max_packobj_size, dedup_threshold, debug),
+      max_apo_entries(max_apo_entries), bv_len(bv_len),
+      similarity_threshold(similarity_threshold) {
+      type = PackerType::Heuristic;
+    }
+  virtual ~HeuristicPacker() {}
+
+  virtual int pack(string fp, int chunk_size, string src_oid, int* poid = nullptr) override {
+    // check if fp is packed
+    int chunk_poid = -1;
+    if (check_packed(fp, chunk_poid)) {
+      return chunk_poid;
+    }
+
+    int target_poid = *poid;
+    unique_lock al(apo_lock);
+    if (active_pack_objs.find(target_poid) == active_pack_objs.end()) {
+      active_pack_objs.emplace(target_poid,
+          make_pair(generate_bf(vector<string>(), chunk_size), 0));
+      ++poid_idx;
+    }
+    pair<bloom_filter, uint64_t>& apo_entry = active_pack_objs[target_poid];
+    // target pack object is full
+    if (apo_entry.second >= max_packobj_size) {
+      active_pack_objs.erase(target_poid);
+      al.unlock();
+      return -EAGAIN;
+    }
+
+    // update apo entry
+    apo_entry.first.insert(fp);
+    apo_entry.second += chunk_size;
+    al.unlock();
+
+    unique_lock fl(fpmap_lock);
+    auto fp_entry = fp_store.find(fp);
+    ceph_assert(fp_entry != fp_store.end());
+    fp_entry->second.second = target_poid;
+    fl.unlock();
+    return target_poid;
+  }
+
+  bloom_filter generate_bf(const vector<string>& fps, uint64_t chunk_size) {
+    uint64_t expected_cnt = max_packobj_size / chunk_size;
+    bloom_filter bf(1, bv_len, 0, expected_cnt * 10);
+    for (auto& fp : fps) {
+      bf.insert(fp);
+    }
+    return bf;
+  }
+
+  uint32_t get_hamming_similarity(bloom_filter& mo_bf, bloom_filter& entry_bf) {
+    uint32_t score = 0;
+    // bit-vector of the metadata object
+    const unsigned char* mo_bv = mo_bf.table();
+    // bit-vector of the APO entry
+    const unsigned char* entry_bv = entry_bf.table();
+
+    for (uint32_t i = 0; i < mo_bf.size() / CHAR_BIT; ++i) {
+      unsigned char common_bits = mo_bv[i] &  entry_bv[i];
+      // count set bits
+      while (common_bits) {
+        score += common_bits & 1;
+        common_bits >>= 1;
+      }
+    }
+    return score;
+  }
+
+  uint32_t get_similarity(vector<string>& mo_fps, bloom_filter& entry_bf) {
+    uint32_t score = 0;
+    for (auto& fp : mo_fps) {
+      if (entry_bf.contains(fp)) {
+        ++score;
+      }
+    }
+    return score;
+  }
+
+  int get_similar_poid(bloom_filter& mo_bf, uint64_t chunk_size) {
+    int target_poid = -1;
+    uint32_t max_score = 0;
+    int min_size_poid = -1;
+    int min_po_size = INT_MAX;
+
+    unique_lock al(apo_lock);
+    if (active_pack_objs.empty()) {
+      target_poid = poid_idx;
+      al.unlock();
+      return target_poid;
+    }
+
+    // find the most similar pack object
+    for (auto& kv : active_pack_objs) {
+      if (kv.second.second <= 0) {
+        continue;
+      }
+      bloom_filter& po_bf = kv.second.first;
+      uint32_t score = get_hamming_similarity(mo_bf, po_bf);
+      int poid = kv.first;
+      if (score > max_score) {
+        max_score = score;
+        target_poid = poid;
+      }
+
+      // update minimum pack object size just in case of similarity not found
+      int po_size = kv.second.second;
+      if (po_size < min_po_size) {
+        min_po_size = po_size;
+        min_size_poid = poid;
+      }
+    }
+
+    // similarity not found
+    if (max_score < similarity_threshold) {
+      // APO entries full. append to smallest pack object
+      if (active_pack_objs.size() >= max_apo_entries) {
+        if (debug) {
+  cout << "apo map full. " << min_size_poid << " is selected" << std::endl;
+        }
+        target_poid = min_size_poid;
+      } else {
+        target_poid = poid_idx;
+      }
+    }
+    al.unlock();
+    return target_poid;
   }
 };
 
@@ -1371,7 +1519,6 @@ public:
       unsigned op_size = max_read_size;
       for (const auto & i : result) {
         const auto &oid = i.oid;
-        cout << oid << std::endl;
         if (m_stop) {
           return;
         }
@@ -1424,12 +1571,28 @@ public:
         if (est == dedup_estimates.end()) {
   cerr << "dedup estimate result set error" << std::endl;
         }
+
         vector<pair<uint64_t, uint64_t>> chunks;  // chunk boundaries
         set<string> pack_objs;  // for estimating fragmentation ratio
         
         // do chunking
         est->second.cdc->calc_chunks(bl, &chunks);
+        bloom_filter mo_bf;
+
         vector<string> fps = est->second.get_fps(bl, chunks, fp_algo);
+        int poid = -1;  // only for heuristic packing
+        if (packer->get_type() == "heuristic") {
+  mo_bf
+    = static_cast<HeuristicPacker*>(packer.get())->generate_bf(fps, chunk_size);
+
+  poid
+    = static_cast<HeuristicPacker*>(packer.get())->get_similar_poid(mo_bf, chunk_size);
+        }
+        if (debug) {
+          cout << "moid: " << oid << ", poid: " << poid << ", apo size: "
+            << static_cast<HeuristicPacker*>(packer.get())->active_pack_objs.size()
+            << std::endl;
+        }
 
         uint32_t deduped = 0;
         uint32_t not_deduped = 0;
@@ -1440,7 +1603,16 @@ public:
 
   // if chunk is duplicated enough, do packing (dedup)
   if (packer->check_duplicated(fp)) {
-    int packed_oid = packer->pack(fp, chunk_len, oid);
+    int packed_oid = packer->pack(fp, chunk_len, oid, &poid);
+    while (packed_oid == -EAGAIN) {
+      // recalculate target pack object and retry packing if po pull
+      if (packed_oid == -EAGAIN && packer->get_type() == "heuristic") {
+        poid
+          = static_cast<HeuristicPacker*>(packer.get())->get_similar_poid(mo_bf, chunk_size);
+        packed_oid = packer->pack(fp,chunk_len, oid, &poid);
+      }
+    }
+
     pack_objs.emplace(to_string(packed_oid));
     ++deduped;
   } else {
@@ -1523,6 +1695,21 @@ int estimate_fragmentation(const po::variables_map &opts)
     packer_type = opts["packer-type"].as<string>();
   }
 
+  uint32_t max_apo_entries = 0; // default max apo entries
+  if (opts.count("max-apo-entries")) {
+    max_apo_entries = opts["max-apo-entries"].as<uint32_t>();
+  }
+
+  uint32_t bv_len = 32768;  // default bit vector length
+  if (opts.count("bit-vector-len")) {
+    bv_len = opts["bit-vector-len"].as<uint32_t>();
+  }
+
+  uint32_t similarity_threshold = 10; // default similarity threshold
+  if (opts.count("similarity-threshold")) {
+    similarity_threshold = opts["similarity-threshold"].as<uint32_t>();
+  }
+
   ret = rados.init_with_context(g_ceph_context);
   if (ret < 0) {
      cerr << "couldn't initialize rados: " << cpp_strerror(ret) << std::endl;
@@ -1572,8 +1759,13 @@ int estimate_fragmentation(const po::variables_map &opts)
   }
   librados::pool_stat_t s = stats[pool_name];
 
-  shared_ptr<SimplePacker> packer
-    = make_shared<SimplePacker>(pack_obj_size, dedup_threshold, debug);
+  shared_ptr<Packer> packer;
+  if (packer_type == "simple") {
+    packer = make_shared<SimplePacker>(pack_obj_size, dedup_threshold, debug);
+  } else {
+    packer = make_shared<HeuristicPacker>(pack_obj_size, dedup_threshold, debug,
+        max_apo_entries, bv_len, similarity_threshold);
+  }
 
   for (int i = 0; i < num_threads; ++i) {
     std::unique_ptr<EstimateFragmentationRatio> ptr (
@@ -1592,6 +1784,7 @@ int estimate_fragmentation(const po::variables_map &opts)
   cout << "all threads dead" << std::endl;
 
   print_dedup_estimate(cerr, chunk_algo);
+  cout << "print dedup estimate done" << std::endl;
   // print fragmentation info
   uint64_t total_read_ops = 0;
   uint64_t num_deduped_chunks= 0;
@@ -1609,6 +1802,11 @@ int estimate_fragmentation(const po::variables_map &opts)
   cerr << "the number of packed chunks: " << num_deduped_chunks << std::endl;
   cerr << "the number of deduped metadata objs: " << num_deduped_metaobjs << std::endl;
   cerr << "avg read ops: " << total_read_ops / (double) num_deduped_metaobjs << std::endl;
+
+  // print bloom filter memory usage size
+  bloom_filter tmp_bf(1, bv_len, 0, pack_obj_size / chunk_size * 10);
+  cerr << "bit vector size : " << tmp_bf.size() / CHAR_BIT << ", bloom_filter size: "
+    << sizeof(tmp_bf) << std::endl;
 
   return 0;
 }
