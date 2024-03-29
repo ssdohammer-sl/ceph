@@ -770,6 +770,15 @@ inline namespace v14_2_0 {
      * updates.
      */
     void tier_evict();
+
+    /**
+     *  extended set-chunk for pack object and chunk metadata object
+     *  @param index_ioctx [in] index pool
+     *  @param index_oid   [in] chunk metadata object id in the index pool
+     */
+    void set_packed_chunk(uint64_t src_offset, uint64_t src_length, const IoCtx& tgt_ioctx,
+                          std::string tgt_oid, uint64_t tgt_offset, const IoCtx& index_ioctx,
+                          std::string index_oid, int flag = 0);
   };
 
   /* IoCtx : This is a context in which we can perform I/O.

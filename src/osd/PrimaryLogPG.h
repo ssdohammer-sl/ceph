@@ -1455,6 +1455,8 @@ protected:
 			   ObjectContextRef& _l, ObjectContextRef& _g);
   bool inc_refcount_by_set(OpContext* ctx, object_manifest_t& tgt,
 			   OSDOp& osd_op);
+  bool inc_refcount_by_set(OpContext* ctx, object_manifest_t& tgt,
+			   OSDOp& osd_op, hobject_t idx_oid);
   int do_cdc(const object_info_t& oi, std::map<uint64_t, chunk_info_t>& chunk_map,
 	     std::map<uint64_t, bufferlist>& chunks);
   int start_dedup(OpRequestRef op, ObjectContextRef obc);
