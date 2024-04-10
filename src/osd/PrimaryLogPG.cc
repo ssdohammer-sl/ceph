@@ -3576,7 +3576,7 @@ void PrimaryLogPG::get_adjacent_clones(ObjectContextRef src_obc,
 }
 
 bool PrimaryLogPG::inc_refcount_by_set(OpContext* ctx, object_manifest_t& set_chunk,
-				       OSDOp& osd_op)
+				       OSDOp& osd_op, uint32_t ref_set_num)
 {
   object_ref_delta_t refs;
   ObjectContextRef obc_l, obc_g;
@@ -3606,7 +3606,7 @@ bool PrimaryLogPG::inc_refcount_by_set(OpContext* ctx, object_manifest_t& set_ch
 	auto length = c.second.length;	
 	auto* fin = new C_SetManifestRefCountDone(this, ctx->obs->oi.soid, offset);
 	ceph_tid_t tid = refcount_manifest(ctx->obs->oi.soid, target_oid,
-					    refcount_t::INCREMENT_REF, fin, std::nullopt);
+					    refcount_t::INCREMENT_REF, fin, std::nullopt, ref_set_num);
 	fin->tid = tid;
 	mop->chunks[target_oid] = make_pair(offset, length);
 	mop->num_chunks++;
@@ -3774,7 +3774,7 @@ void PrimaryLogPG::dec_all_refcount_manifest(const object_info_t& oi, OpContext*
 }
 
 ceph_tid_t PrimaryLogPG::refcount_manifest(hobject_t src_soid, hobject_t tgt_soid, refcount_t type,
-                                     Context *cb, std::optional<bufferlist> chunk)
+                                     Context *cb, std::optional<bufferlist> chunk, uint32_t ref_set_num)
 {
   unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY |
                    CEPH_OSD_FLAG_RWORDERED;
@@ -3788,6 +3788,7 @@ ceph_tid_t PrimaryLogPG::refcount_manifest(hobject_t src_soid, hobject_t tgt_soi
     cls_cas_chunk_get_ref_op call;
     call.source = src_soid.get_head();
     ::encode(call, in);
+    ::encode(ref_set_num, in);
     obj_op.call("cas", "chunk_get_ref", in);
   } else if (type == refcount_t::DECREMENT_REF) {
     cls_cas_chunk_put_ref_op call;
@@ -7275,6 +7276,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	object_locator_t tgt_oloc, idx_oloc;
 	uint64_t src_offset, src_length, tgt_offset;
 	object_t tgt_name, idx_name;
+        uint32_t ref_set_num;
 	try {
 	  decode(src_offset, bp);
 	  decode(src_length, bp);
@@ -7285,6 +7287,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       decode(idx_oloc, bp);
       decode(idx_name, bp);
     }
+          decode(ref_set_num, bp);
 	}
 	catch (ceph::buffer::error& e) {
 	  result = -EINVAL;
@@ -7357,7 +7360,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
           idx_pg.ps(), idx_pg.pool(), idx_oloc.nspace);
       need_inc_ref = inc_refcount_by_set(ctx, set_chunk, osd_op, idx_oid);
     } else {
-      need_inc_ref = inc_refcount_by_set(ctx, set_chunk, osd_op);
+      need_inc_ref = inc_refcount_by_set(ctx, set_chunk, osd_op, ref_set_num);
     }
 	  if (need_inc_ref) {
 	    result = -EINPROGRESS;

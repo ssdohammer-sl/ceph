@@ -23,11 +23,18 @@ CLS_NAME(cas)
 
 static int chunk_read_refcount(
   cls_method_context_t hctx,
-  chunk_refs_t *objr)
+  chunk_refs_t *objr,
+  uint32_t ref_set_num = 0)
 {
   bufferlist bl;
   objr->clear();
-  int ret = cls_cxx_getxattr(hctx, CHUNK_REFCOUNT_ATTR, &bl);
+  std::string ref_key = CHUNK_REFCOUNT_ATTR;
+  if (ref_set_num > 0) {
+    ref_key += ("_" + std::to_string(ref_set_num));
+  }
+  CLS_LOG(0, "$$$$$$$$$$ chunk-read_refcount() ref ref key: %s\n", ref_key.c_str());
+
+  int ret = cls_cxx_getxattr(hctx, ref_key.c_str(), &bl);
   if (ret == -ENODATA) {
     return 0;
   }
@@ -123,8 +130,10 @@ static int chunk_get_ref(cls_method_context_t hctx,
   auto in_iter = in->cbegin();
 
   cls_cas_chunk_get_ref_op op;
+  uint32_t ref_set_num;
   try {
     decode(op, in_iter);
+    decode(ref_set_num, in_iter);
   } catch (ceph::buffer::error& err) {
     CLS_LOG(1, "ERROR: failed to decode entry\n");
     return -EINVAL;

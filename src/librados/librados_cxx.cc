@@ -654,12 +654,13 @@ void librados::ObjectReadOperation::set_chunk(uint64_t src_offset,
 					       const IoCtx& tgt_ioctx,
 					       string tgt_oid,
 					       uint64_t tgt_offset,
-					       int flag)
+					       int flag,
+                                               uint32_t ref_set_num)
 {
   ceph_assert(impl);
   ::ObjectOperation *o = &impl->o;
   o->set_chunk(src_offset, src_length,
-	       tgt_ioctx.io_ctx_impl->oloc, object_t(tgt_oid), tgt_offset, flag);
+	       tgt_ioctx.io_ctx_impl->oloc, object_t(tgt_oid), tgt_offset, ref_set_num, flag);
 }
 
 void librados::ObjectReadOperation::set_packed_chunk(uint64_t src_offset,

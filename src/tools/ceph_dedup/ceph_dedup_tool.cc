@@ -2066,8 +2066,29 @@ int estimate_fragmentation(const po::variables_map &opts)
   return 0;
 }
 
+string generate_fingerprint(bufferlist chunk_data)
+{
+  return crypto::digest<crypto::SHA1>(chunk_data).to_str();
+}
+
+vector<tuple<bufferlist,pair<uint64_t, uint64_t>>>
+do_cdc(ObjectItem& object, bufferlist& data, size_t chunk_size)
+{
+  vector<tuple<bufferlist, pair<uint64_t, uint64_t>>> ret;
+  unique_ptr<CDC> cdc = CDC::create("fastcdc", cbits(chunk_size) - 1);
+  vector<pair<uint64_t, uint64_t>> chunks;
+  cdc->calc_chunks(data, &chunks);
+  for (auto& p : chunks) {
+    bufferlist chunk;
+    chunk.substr_of(data, p.first, p.second);
+    ret.push_back(make_tuple(chunk, p));
+  }
+  return ret;
+}
+
 int test_many_refs(const po::variables_map &opts)
 {
+  /*
   string base_pool_name = get_opts_pool_name(opts);
   string chunk_pool_name;
   if (opts.count("chunk-pool")) {
@@ -2239,6 +2260,184 @@ int test_many_refs(const po::variables_map &opts)
   dedup_end = time(NULL);
   double dedup_latency = (double)(dedup_end - dedup_start);
   cout << idx << ",
+  */
+    return 0;
+}
+
+int test_dist_refs(const po::variables_map &opts)
+{
+  string base_pool_name = get_opts_pool_name(opts);
+  string chunk_pool_name;
+  if (opts.count("chunk-pool")) {
+    chunk_pool_name = opts["chunk-pool"].as<string>();
+  } else {
+    cout << "chunk pool name missed" << std::endl;
+  }
+  cout << "base pool name: " << base_pool_name << ", chunk pool name: "
+       << chunk_pool_name << std::endl;
+
+  size_t chunk_size = 16384;
+  if (opts.count("chunk-size")) {
+    chunk_size = opts["chunk-size"].as<int>();
+  } else {
+    cout << "1024 is set as chunk size by default" << std::endl;
+  }
+
+  Rados rados;
+  int ret = rados.init_with_context(g_ceph_context);
+  if (ret < 0) {
+    cerr << "couldn't initialize rados: " << cpp_strerror(ret) << std::endl;
+    return -EINVAL;
+  }
+  ret = rados.connect();
+  if (ret) {
+    cerr << "couldn't connect to cluster: " << cpp_strerror(ret) << std::endl;
+    return -EINVAL;
+  }
+
+  IoCtx ioctx, chunk_ioctx;
+  ret = rados.ioctx_create(base_pool_name.c_str(), ioctx);
+  if (ret < 0) {
+    cerr << "error opening base pool "
+      << base_pool_name << ": "
+      << cpp_strerror(ret) << std::endl;
+    return -EINVAL;
+  }
+  ret = rados.ioctx_create(chunk_pool_name.c_str(), chunk_ioctx);
+  if (ret < 0) {
+    cerr << "error opening chunk pool "
+      << chunk_pool_name << ": "
+      << cpp_strerror(ret) << std::endl;
+    return -EINVAL;
+  }
+
+  // write 4MB zero-filled data
+  bufferlist zerodata;
+  for (int i = 0; i < 256 * 1024; ++i) {
+    zerodata.append("0000000000000000");
+  }
+
+  for (int i = 0; i < 1024; ++i) {
+    bufferlist bl;
+    bl.append(zerodata);
+    ObjectWriteOperation wop;
+    wop.write_full(bl);
+    chunk_ioctx.operate("zero_" + to_string(i), &wop);
+  }
+  cout << "Write chunk object done" << std::endl;
+  sleep(10);
+
+  unordered_map<string, uint64_t> fp_map;
+  map<string, uint32_t> highly_dup_chunks;
+  ObjectCursor cursor = ioctx.object_list_begin();
+  ObjectCursor end = ioctx.object_list_end();
+  uint32_t idx = 0;
+  uint64_t set_chunk_latency_sum = 0;
+  while (cursor < end) {
+    vector<ObjectItem> objs;
+    chrono::system_clock::time_point start_dedup = chrono::system_clock::now();
+    ret = ioctx.object_list(cursor, end, 12, {}, &objs, &cursor);
+    if (ret < 0) {
+      cerr << "error object_list: " << cpp_strerror(ret) << std::endl;
+    }
+
+    for (auto& obj : objs) {
+      // read object
+      bufferlist obj_data;
+      size_t offset = 0;
+      ret = -1;
+      while (ret != 0) {
+        bufferlist partial;
+        ret = ioctx.read(obj.oid, partial, default_op_size, offset);
+        if (ret < 0) {
+          cerr << "read object errer " << obj.oid << " offset: " << offset
+            << " error(" << cpp_strerror(ret) << std::endl;
+          return -1;
+        }
+        offset += ret;
+        obj_data.claim_append(partial);
+      }
+
+      // chunking
+      auto chunks = do_cdc(obj, obj_data, chunk_size);
+
+      // fingerprinting
+      for (auto& chunk : chunks) {
+        auto& chunk_data = get<0>(chunk);
+        string fp = generate_fingerprint(chunk_data);
+        pair<uint64_t, uint64_t> chunk_boundary = get<1>(chunk);
+
+        // comparing
+        auto iter = fp_map.find(fp);
+        if (iter != fp_map.end()) {
+          ++iter->second;
+        } else {
+          fp_map.insert({fp, 1});
+        }
+
+        /*
+        // check deduped
+        uint64_t size;
+        time_t mtime;
+        ret = chunk_ioctx.stat(fp, &size, &mtime);
+        if (ret == -ENOENT) {
+          bufferlist bl;
+          bl.append(chunk_data);
+          ObjectWriteOperation wop;
+          wop.write_full(bl);
+          chunk_ioctx.operate(fp, &wop);
+        }
+        */
+        string refcnt_key = CHUNK_REFCOUNT_ATTR;
+        if (highly_dup_chunks.find(fp) != highly_dup_chunks.end()) {
+          string postfix = "_" + to_string(highly_dup_chunks[fp]);
+          refcnt_key += postfix;
+        }
+
+        bufferlist t;
+        ret = chunk_ioctx.getxattr(fp, refcnt_key.c_str(), t);
+        if (ret == -ENOENT) {
+          bufferlist bl;
+          bl.append(chunk_data);
+          ObjectWriteOperation wop;
+          wop.write_full(bl);
+          chunk_ioctx.operate(fp, &wop);
+        } else if (ret < 0) {
+          return ret;
+        }
+        chunk_refs_t refs;
+        auto p = t.cbegin();
+        decode(refs, p);
+
+        uint32_t ref_set_num = 0;
+        if (refs.count() >= 10000) {
+          if (highly_dup_chunks.find(fp) != highly_dup_chunks.end()) {
+            ++highly_dup_chunks[fp];
+          } else {
+            highly_dup_chunks.insert({fp, 1});
+          }
+          ref_set_num = highly_dup_chunks[fp];
+        }
+
+        // do set chunk
+        ObjectReadOperation rop;
+        rop.set_chunk(chunk_boundary.first, chunk_boundary.second, chunk_ioctx,
+            fp, 0, CEPH_OSD_OP_FLAG_WITH_REFERENCE, ref_set_num);
+        chrono::system_clock::time_point start_set_chunk = chrono::system_clock::now();
+        ret = ioctx.operate(obj.oid, &rop, nullptr);
+        chrono::system_clock::time_point end_set_chunk = chrono::system_clock::now();
+        chrono::duration<long long, std::milli> set_chunk_milli = chrono::duration_cast<chrono::milliseconds>(end_set_chunk - start_set_chunk);
+        set_chunk_latency_sum += set_chunk_milli.count();
+      }
+
+      chrono::system_clock::time_point end_dedup = chrono::system_clock::now();
+      chrono::duration<long long, std::milli> dedup_milli = chrono::duration_cast<chrono::milliseconds>(end_dedup - start_dedup);
+
+      cout << ++idx << "," << dedup_milli.count() << "," << set_chunk_latency_sum << std::endl;
+    }
+  }
+
+  return 0;
 }
 
 int main(int argc, const char **argv)
@@ -2327,7 +2526,9 @@ int main(int argc, const char **argv)
   } else if (op_name == "frag-info") {
     ret = estimate_fragmentation(opts);
   } else if (op_name == "many-refs-test") {
-    ret = test_many_resf(opts);
+    ret = test_many_refs(opts);
+  } else if (op_name == "ref-dist") {
+    ret = test_dist_refs(opts);
   } else {
     cerr << "unrecognized op " << op_name << std::endl;
     exit(1);

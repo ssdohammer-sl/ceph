@@ -1444,7 +1444,7 @@ protected:
   void cancel_and_requeue_proxy_ops(hobject_t oid);
   void cancel_manifest_ops(bool requeue, std::vector<ceph_tid_t> *tids);
   ceph_tid_t refcount_manifest(hobject_t src_soid, hobject_t tgt_soid, refcount_t type,
-			      Context *cb, std::optional<bufferlist> chunk);
+			      Context *cb, std::optional<bufferlist> chunk, uint32_t ref_set_num = 0);
   void dec_all_refcount_manifest(const object_info_t& oi, OpContext* ctx);
   void dec_refcount(const hobject_t& soid, const object_ref_delta_t& refs);
   void update_chunk_map_by_dirty(OpContext* ctx);
@@ -1454,7 +1454,7 @@ protected:
   void get_adjacent_clones(ObjectContextRef src_obc, 
 			   ObjectContextRef& _l, ObjectContextRef& _g);
   bool inc_refcount_by_set(OpContext* ctx, object_manifest_t& tgt,
-			   OSDOp& osd_op);
+			   OSDOp& osd_op, uint32_t ref_set_num = 0);
   bool inc_refcount_by_set(OpContext* ctx, object_manifest_t& tgt,
 			   OSDOp& osd_op, hobject_t idx_oid);
   int do_cdc(const object_info_t& oi, std::map<uint64_t, chunk_info_t>& chunk_map,

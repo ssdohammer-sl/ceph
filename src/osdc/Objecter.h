@@ -1602,7 +1602,7 @@ struct ObjectOperation {
   }
 
   void set_chunk(uint64_t src_offset, uint64_t src_length, object_locator_t tgt_oloc,
-		 object_t tgt_oid, uint64_t tgt_offset, int flag) {
+		 object_t tgt_oid, uint64_t tgt_offset, uint32_t ref_set_num, int flag) {
     using ceph::encode;
     OSDOp& osd_op = add_op(CEPH_OSD_OP_SET_CHUNK);
     encode(src_offset, osd_op.indata);
@@ -1610,6 +1610,7 @@ struct ObjectOperation {
     encode(tgt_oloc, osd_op.indata);
     encode(tgt_oid, osd_op.indata);
     encode(tgt_offset, osd_op.indata);
+    encode(ref_set_num, osd_op.indata);
     set_last_op_flags(flag);
   }
   
