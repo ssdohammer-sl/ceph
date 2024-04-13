@@ -208,6 +208,7 @@ public:
 
     // return true if the chunk is duplicate
     bool add(chunk_t& chunk) {
+      /*
       std::unique_lock lock(fingerprint_lock);
       auto entry = fp_map.find(chunk.fingerprint);
       total_bytes += chunk.size;
@@ -223,6 +224,8 @@ public:
 	entry = fp_map.increment_reference(entry);
       }
       return entry.is_above_threshold();
+      */
+      return true;
     }
 
     bool is_fpmap_full() const {
@@ -437,9 +440,6 @@ void SampleDedupWorkerThread::crawl()
       }
     }
     do_dedup(redundant_chunks);
-    if (primary) {
-      store_checkpoint_info(threads);
-    }
     dout(20) << "total redundant chunk size found so far: " << total_duplicated_size
       << ", total size deduplicated: " <<  total_deduped_size << dendl;
   }
@@ -552,6 +552,7 @@ void SampleDedupWorkerThread::do_dedup(list<chunk_t> &redundant_chunks)
     } 
 
     if (ret < 0) {
+      dout(0) << "set chunk failed" << dendl;
       return ret;
     }
 
@@ -606,7 +607,7 @@ void SampleDedupWorkerThread::do_dedup(list<chunk_t> &redundant_chunks)
 	wait_evict_comp.push_back(std::make_pair(p, std::move(comp)));
       }
     } else {
-      dout(5) << " set_chunk returns: " << ret << dendl;
+      dout(0) << " set_chunk returns: " << ret << dendl;
     }
     std::unique_lock l{m_lock};
     if (stop) {
@@ -727,7 +728,7 @@ int make_crawling_daemon(const po::variables_map &opts)
   }
   d_opts.load_dedup_conf_from_argument(opts);
 
-  bool snap = true;
+  bool snap = false;
   if (opts.count("no-snap")) {
     snap = false;
   }

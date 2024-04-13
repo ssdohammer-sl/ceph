@@ -344,6 +344,8 @@ public:
 
   virtual string pack(string fp, int chunk_size, string src_oid, uint64_t src_offset,
       uint64_t src_len, bufferlist& chunk_data, int* poid = nullptr) override {
+    cout << "chunk_size: " << chunk_size << ", chunk_data.len() << " << chunk_data.length() << std::endl;
+    cout << "src_len: " << src_len << std::endl;
     assert(*poid < 0);
     int ret;
 
@@ -406,11 +408,14 @@ public:
         cerr << "create chunk metadata object failed. " << cpp_strerror(ret) << std::endl;
         return string();
       }
+      cout << "write chunk metadata object " << fp << " done" << std::endl;
 
       // write packobj location in chunk metadata object's xattr
       bufferlist loc;
+      cout << "po_name: " << po_name << ", pack_obj_size: " << pack_obj_size << std::endl;
       encode(make_pair(po_name, pack_obj_size), loc);
       ret = index_ioctx.setxattr(fp, "chunk_location", loc);
+      cout << "setxattr " << fp << " done" << std::endl;
 
       // do set-packed-chunk
       ObjectReadOperation rop;
@@ -1772,7 +1777,7 @@ public:
   if (packer->check_duplicated(fp)) {
     string po_name = packer->pack(fp, chunk_len, oid, chunk_offset, chunk_len,
         chunk_data, &poid);
-    cout << fp << " packed in " << po_name << std::endl;
+    //cout << fp << " packed in " << po_name << std::endl;
     while (po_name == "FULL" && packer->get_type() == "heuristic") {
       //cout << "oid: " << oid << " calculate again" << std::endl;
       // recalculate target pack object and retry packing if po pull
@@ -1788,7 +1793,7 @@ public:
       deduped++;
     }
   } else {
-    cout << fp << " not duped" << std::endl;
+    //cout << fp << " not duped" << std::endl;
     // add metadata object oid for not duplicated chunk
     not_deduped++;
   }
@@ -1820,7 +1825,7 @@ public:
         for (auto& completion : evict_completions) {
           completion->wait_for_complete();
         }
-        cout << num_evict_oids << " evicted" << std::endl;
+        //cout << num_evict_oids << " evicted" << std::endl;
       }
     }
   }
