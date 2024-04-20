@@ -165,6 +165,7 @@ po::options_description make_usage() {
     ("max-apo-entries", po::value<uint32_t>(), ": maximum number of ActivePackObject entries")
     ("bit-vector-len", po::value<uint32_t>(), ": bit vector length of the bloom filter")
     ("similarity-threshold", po::value<uint32_t>(), ": low threshold value of hamming similarity")
+    ("num-ref-shard", po::value<int>(), ": the number of key-value shard")
     ("do-dedup", ": store chunk data and chunk metadata object")
   ;
   desc.add(op_desc);
@@ -2283,6 +2284,13 @@ int test_dist_refs(const po::variables_map &opts)
     cout << "1024 is set as chunk size by default" << std::endl;
   }
 
+  // default is no dist
+  int num_ref_shard = -1;
+  if (opts.count("num-ref-shard")) {
+    num_ref_shard = opts["num-ref-shard"].as<int>();
+  }
+  cout << "num-ref-shard is set to " << num_ref_shard << std::endl;
+
   Rados rados;
   int ret = rados.init_with_context(g_ceph_context);
   if (ret < 0) {
@@ -2317,25 +2325,54 @@ int test_dist_refs(const po::variables_map &opts)
     zerodata.append("0000000000000000");
   }
 
-  for (int i = 0; i < 1024; ++i) {
+  for (int i = 0; i < 500; ++i) {
+  //for (int i = 0; i < 200; ++i) {
     bufferlist bl;
     bl.append(zerodata);
     ObjectWriteOperation wop;
     wop.write_full(bl);
-    chunk_ioctx.operate("zero_" + to_string(i), &wop);
+    ioctx.operate("zero_" + to_string(i), &wop);
   }
-  cout << "Write chunk object done" << std::endl;
-  sleep(10);
+  cout << "Write object done" << std::endl;
+  sleep(5);
+
+  // write chunk object
+  string chunkid = "2ee7c788198383455a6ee739d89ca34c3831103d";
+  {
+    bufferlist bl;
+    for (int i = 0; i < 1024; ++i) {
+      bl.append("0000000000000000");
+    }
+    ObjectWriteOperation wop;
+    wop.write_full(bl);
+    chunk_ioctx.operate(chunkid, &wop);
+  }
+
+  string refcnt_key = CHUNK_REFCOUNT_ATTR;
+  if (num_ref_shard >= 0) {
+    ret = chunk_ioctx.rmxattr(chunkid, refcnt_key.c_str());
+    if (ret < 0) {
+      cout << "failed to rmattr" << std::endl;
+    }
+    for (int i = 0; i < num_ref_shard; ++i) {
+      chunk_refs_t objr;
+      bufferlist bl;
+      encode(objr, bl);
+      string gen_key = refcnt_key + to_string(i);
+      ret = chunk_ioctx.setxattr(chunkid, gen_key.c_str(), bl);
+      if (ret < 0) {
+        cout << "new ref set key setxattr failed " << cpp_strerror(ret) << std::endl;
+      }
+    }
+  }
 
   unordered_map<string, uint64_t> fp_map;
-  map<string, uint32_t> highly_dup_chunks;
+  //map<string, uint32_t> highly_dup_chunks;
   ObjectCursor cursor = ioctx.object_list_begin();
   ObjectCursor end = ioctx.object_list_end();
   uint32_t idx = 0;
-  uint64_t set_chunk_latency_sum = 0;
   while (cursor < end) {
     vector<ObjectItem> objs;
-    chrono::system_clock::time_point start_dedup = chrono::system_clock::now();
     ret = ioctx.object_list(cursor, end, 12, {}, &objs, &cursor);
     if (ret < 0) {
       cerr << "error object_list: " << cpp_strerror(ret) << std::endl;
@@ -2345,7 +2382,9 @@ int test_dist_refs(const po::variables_map &opts)
       // read object
       bufferlist obj_data;
       size_t offset = 0;
+      uint64_t set_chunk_latency_sum = 0;
       ret = -1;
+      chrono::system_clock::time_point start_dedup = chrono::system_clock::now();
       while (ret != 0) {
         bufferlist partial;
         ret = ioctx.read(obj.oid, partial, default_op_size, offset);
@@ -2356,6 +2395,25 @@ int test_dist_refs(const po::variables_map &opts)
         }
         offset += ret;
         obj_data.claim_append(partial);
+      }
+      //cout << "oid: " << obj.oid << " read done" << std::endl;
+
+      int shard_id = -1;
+      // reference sharding
+      if (num_ref_shard >= 0) {
+        uint32_t hash;
+        ret = chunk_ioctx.get_object_hash_position2(obj.oid, &hash);
+        if (ret < 0) {
+          return ret;
+        }
+        uint32_t upper_hash = hash / 100000;
+        uint32_t lower_hash = hash % 100000;
+        hash = upper_hash + lower_hash;
+
+        cout << "obj: " << obj.oid << ", upper_hash: " << upper_hash << ", lower hash: " << lower_hash << ", hash: " << hash << std::endl;
+        shard_id = hash % num_ref_shard;
+        refcnt_key += to_string(shard_id);
+        cout << "refcnt_key: " << refcnt_key << std::endl;
       }
 
       // chunking
@@ -2388,50 +2446,75 @@ int test_dist_refs(const po::variables_map &opts)
           chunk_ioctx.operate(fp, &wop);
         }
         */
-        string refcnt_key = CHUNK_REFCOUNT_ATTR;
+        /*
         if (highly_dup_chunks.find(fp) != highly_dup_chunks.end()) {
-          string postfix = "_" + to_string(highly_dup_chunks[fp]);
+          ref_set_num = highly_dup_chunks[fp];
+          string postfix = "_" + to_string(ref_set_num);
           refcnt_key += postfix;
         }
+        */
 
         bufferlist t;
+        chunk_refs_t refs;
         ret = chunk_ioctx.getxattr(fp, refcnt_key.c_str(), t);
+        /*
         if (ret == -ENOENT) {
+          // no chunk object
           bufferlist bl;
           bl.append(chunk_data);
           ObjectWriteOperation wop;
           wop.write_full(bl);
           chunk_ioctx.operate(fp, &wop);
         } else if (ret < 0) {
-          return ret;
-        }
-        chunk_refs_t refs;
-        auto p = t.cbegin();
-        decode(refs, p);
-
-        uint32_t ref_set_num = 0;
-        if (refs.count() >= 10000) {
-          if (highly_dup_chunks.find(fp) != highly_dup_chunks.end()) {
-            ++highly_dup_chunks[fp];
-          } else {
-            highly_dup_chunks.insert({fp, 1});
+          // chunk object exists, but no key
+          chunk_refs_t objr;
+          bufferlist bl;
+          encode(objr, bl);
+          ret = chunk_ioctx.setxattr(fp, refcnt_key.c_str(), bl);
+          if (ret < 0) {
+            cout << "new ref set key setxattr failed " << cpp_strerror(ret) << std::endl;
           }
-          ref_set_num = highly_dup_chunks[fp];
         }
+        */
+
+          /*
+          if (refs.count() >= 10000) {
+            auto iter = highly_dup_chunks.find(fp);
+            if (iter != highly_dup_chunks.end()) {
+              iter->second++;
+            } else {
+              highly_dup_chunks.insert({fp, 1});
+            }
+            ref_set_num = highly_dup_chunks[fp];
+            cout << "fp: " << fp << " dup cnt: " << highly_dup_chunks[fp] << std::endl;
+
+            chunk_refs_t objr;
+            bufferlist bl;
+            encode(objr, bl);
+            string new_key = CHUNK_REFCOUNT_ATTR;
+            new_key += "_" + to_string(highly_dup_chunks[fp]);
+            ret = chunk_ioctx.setxattr(fp, new_key.c_str(), bl);
+            if (ret < 0) {
+              cout << "new ref set key setxattr failed " << cpp_strerror(ret) << std::endl;
+            }
+          }
+          */
 
         // do set chunk
         ObjectReadOperation rop;
         rop.set_chunk(chunk_boundary.first, chunk_boundary.second, chunk_ioctx,
-            fp, 0, CEPH_OSD_OP_FLAG_WITH_REFERENCE, ref_set_num);
+            fp, 0, CEPH_OSD_OP_FLAG_WITH_REFERENCE, shard_id);
         chrono::system_clock::time_point start_set_chunk = chrono::system_clock::now();
         ret = ioctx.operate(obj.oid, &rop, nullptr);
         chrono::system_clock::time_point end_set_chunk = chrono::system_clock::now();
-        chrono::duration<long long, std::milli> set_chunk_milli = chrono::duration_cast<chrono::milliseconds>(end_set_chunk - start_set_chunk);
+        chrono::duration<long long, std::milli> set_chunk_milli
+          = chrono::duration_cast<chrono::milliseconds>(end_set_chunk - start_set_chunk);
         set_chunk_latency_sum += set_chunk_milli.count();
       }
 
       chrono::system_clock::time_point end_dedup = chrono::system_clock::now();
-      chrono::duration<long long, std::milli> dedup_milli = chrono::duration_cast<chrono::milliseconds>(end_dedup - start_dedup);
+      chrono::duration<long long, std::milli> dedup_milli
+        = chrono::duration_cast<chrono::milliseconds>(end_dedup - start_dedup);
 
       cout << ++idx << "," << dedup_milli.count() << "," << set_chunk_latency_sum << std::endl;
     }

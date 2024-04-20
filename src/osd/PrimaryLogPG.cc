@@ -3576,7 +3576,7 @@ void PrimaryLogPG::get_adjacent_clones(ObjectContextRef src_obc,
 }
 
 bool PrimaryLogPG::inc_refcount_by_set(OpContext* ctx, object_manifest_t& set_chunk,
-				       OSDOp& osd_op, uint32_t ref_set_num)
+				       OSDOp& osd_op, int ref_set_num)
 {
   object_ref_delta_t refs;
   ObjectContextRef obc_l, obc_g;
@@ -3774,7 +3774,7 @@ void PrimaryLogPG::dec_all_refcount_manifest(const object_info_t& oi, OpContext*
 }
 
 ceph_tid_t PrimaryLogPG::refcount_manifest(hobject_t src_soid, hobject_t tgt_soid, refcount_t type,
-                                     Context *cb, std::optional<bufferlist> chunk, uint32_t ref_set_num)
+                                     Context *cb, std::optional<bufferlist> chunk, int ref_set_num)
 {
   unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY |
                    CEPH_OSD_FLAG_RWORDERED;
@@ -7276,7 +7276,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	object_locator_t tgt_oloc, idx_oloc;
 	uint64_t src_offset, src_length, tgt_offset;
 	object_t tgt_name, idx_name;
-        uint32_t ref_set_num;
+        int ref_set_num;
 	try {
 	  decode(src_offset, bp);
 	  decode(src_length, bp);

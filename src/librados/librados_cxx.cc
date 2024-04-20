@@ -655,7 +655,7 @@ void librados::ObjectReadOperation::set_chunk(uint64_t src_offset,
 					       string tgt_oid,
 					       uint64_t tgt_offset,
 					       int flag,
-                                               uint32_t ref_set_num)
+                 int ref_set_num)
 {
   ceph_assert(impl);
   ::ObjectOperation *o = &impl->o;
