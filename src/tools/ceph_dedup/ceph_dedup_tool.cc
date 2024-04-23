@@ -2068,6 +2068,7 @@ int estimate_fragmentation(const po::variables_map &opts)
 
 int test_many_refs(const po::variables_map &opts)
 {
+  /*
   string base_pool_name = get_opts_pool_name(opts);
   string chunk_pool_name;
   if (opts.count("chunk-pool")) {
@@ -2239,6 +2240,8 @@ int test_many_refs(const po::variables_map &opts)
   dedup_end = time(NULL);
   double dedup_latency = (double)(dedup_end - dedup_start);
   cout << idx << ",
+  */
+  return 0;
 }
 
 int main(int argc, const char **argv)
@@ -2327,7 +2330,7 @@ int main(int argc, const char **argv)
   } else if (op_name == "frag-info") {
     ret = estimate_fragmentation(opts);
   } else if (op_name == "many-refs-test") {
-    ret = test_many_resf(opts);
+    ret = test_many_refs(opts);
   } else {
     cerr << "unrecognized op " << op_name << std::endl;
     exit(1);

@@ -2502,6 +2502,8 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
     dout(20) << __func__ << ": " << obc->obs.oi.soid 
 	     << " is not manifest object " << dendl;
     return cache_result_t::NOOP;
+  } else {
+    dout(0) << __func__ << ": " << obc->obs.oi.soid << " is manifest object" << dendl;
   }
   if (op->get_req<MOSDOp>()->get_flags() & CEPH_OSD_FLAG_IGNORE_REDIRECT) {
     dout(20) << __func__ << ": ignoring redirect due to flag" << dendl;
@@ -2551,6 +2553,7 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
       }
 
       if (can_proxy_chunked_read(op, obc)) {
+        dout(0) << __func__ << ": " << obc->obs.oi.soid << " can proxy chunked read" << dendl;
 	map<hobject_t,FlushOpRef>::iterator p = flush_ops.find(obc->obs.oi.soid);
         if (p != flush_ops.end()) {
           do_proxy_chunked_op(op, obc->obs.oi.soid, obc, true);
@@ -2559,6 +2562,7 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
 	do_proxy_chunked_op(op, obc->obs.oi.soid, obc, write_ordered);
 	return cache_result_t::HANDLED_PROXY;
       }
+      dout(0) << __func__ << ": " << obc->obs.oi.soid << " can not proxy chunked read" << dendl;
 
       MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
       ceph_assert(m->get_type() == CEPH_MSG_OSD_OP);
@@ -2580,6 +2584,7 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
 	return cache_result_t::BLOCKED_RECOVERY;
       }
 
+      dout(0) << __func__ << ": " << obc->obs.oi.soid << " need promote object" << dendl;
       for (auto& p : obc->obs.oi.manifest.chunk_map) {
 	if (p.second.is_missing()) {
 	  auto m = op->get_req<MOSDOp>();
@@ -3264,6 +3269,7 @@ void PrimaryLogPG::do_proxy_chunked_op(OpRequestRef op, const hobject_t& missing
     object_manifest_t *manifest = &obc->obs.oi.manifest;
     map <uint64_t, map<uint64_t, uint64_t>> chunk_read;
 
+    set<string> read_chunnks;
     while (cursor < op_length) {
       chunk_index = 0;
       chunk_length = 0;
@@ -3305,9 +3311,10 @@ void PrimaryLogPG::do_proxy_chunked_op(OpRequestRef op, const hobject_t& missing
     req_len = cursor - osd_op->op.extent.offset;
     for (auto &p : chunk_read) {
       auto chunks = p.second.begin();
-      dout(20) << __func__ << " chunk_index: " << chunks->first
+      dout(0) << __func__ << " chunk_index: " << chunks->first
 	      << " next_length: " << chunks->second << " cursor: "
 	      << p.first << dendl;
+      dout(0) << "chunk is in : " << manifest->chunk_map[chunks->first].oid << dendl;
       do_proxy_chunked_read(op, obc, i, chunks->first, p.first, chunks->second, req_len, write_ordered);
     }
   }
@@ -4149,6 +4156,7 @@ void PrimaryLogPG::promote_object(ObjectContextRef obc,
     if (obc->obs.oi.manifest.is_chunked()) {
       src_hoid = obc->obs.oi.soid;
       cb = new PromoteCallback(obc, this);
+      dout(0) << __func__ << " create PromoteCallback()" << dendl;`
     } else if (obc->obs.oi.manifest.is_redirect()) {
       object_locator_t src_oloc(obc->obs.oi.manifest.redirect_target);
       my_oloc = src_oloc;
@@ -9576,11 +9584,17 @@ void PrimaryLogPG::_copy_some_manifest(ObjectContextRef obc, CopyOpRef cop, uint
 	  << " start_offset: " << start_offset << " chunks_size: " << chunks_size
 	  << " last_offset: " << last_offset << dendl;
 
+  set<string> promoted_oid;
   iter = manifest->chunk_map.find(start_offset);
   for (;iter != manifest->chunk_map.end(); ++iter) {
     uint64_t obj_offset = iter->first;
     uint64_t length = manifest->chunk_map[iter->first].length;
     hobject_t soid = manifest->chunk_map[iter->first].oid;
+
+    if (promoted_oid.find(soid.oid) != promoted_oid.end()) {
+      continue;
+    }
+
     object_locator_t oloc(soid);
     CopyCallback * cb = NULL;
     CopyOpRef sub_cop(std::make_shared<CopyOp>(cb, ObjectContextRef(), cop->src, oloc,
@@ -9625,6 +9639,7 @@ void PrimaryLogPG::_copy_some_manifest(ObjectContextRef obc, CopyOpRef cop, uint
 	    << manifest->chunk_map[iter->first].offset
 	    << " length: " << length << " pool id: " << oloc.pool
 	    << " tid: " << tid << dendl;
+    promoted_oid.insert(soid.oid);
 
     if (last_offset <= iter->first) {
       break;
