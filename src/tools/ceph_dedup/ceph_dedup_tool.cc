@@ -106,6 +106,8 @@ struct EstimateResult {
 
 map<uint64_t, EstimateResult> dedup_estimates;  // chunk size -> result
 ceph::mutex glock = ceph::make_mutex("glock");
+double prev_frag_ratio = 0.0;
+bool stop_all = false;
 
 po::options_description make_usage() {
   po::options_description desc("Usage");
@@ -184,6 +186,8 @@ static int rados_sistrtoll(I &i, T *val) {
 class EstimateDedupRatio;
 class ChunkScrub;
 class EstimateFragmentationRatio;
+class BuildFpStore;
+class CheckFragRatio;
 class CrawlerThread : public Thread
 {
   IoCtx io_ctx;
@@ -225,6 +229,8 @@ public:
   friend class EstimateDedupRatio;
   friend class ChunkScrub;
   friend class EstimateFragmentationRatio;
+  friend class BuildFpStore;
+  friend class CheckFragRatio;
 };
 
 class Packer
@@ -542,7 +548,7 @@ public:
 };
 
 vector<std::unique_ptr<CrawlerThread>> estimate_threads;
-vector<std::unique_ptr<EstimateFragmentationRatio>> estimate_frag_threads;
+vector<std::unique_ptr<CrawlerThread>> check_threads;
 
 static void print_dedup_estimate(std::ostream& out, std::string chunk_algo)
 {
@@ -586,6 +592,7 @@ static void handle_signal(int signum)
   for (auto &p : estimate_threads) {
     p->signal(signum);
   }
+  stop_all = true;
 }
 
 void EstimateDedupRatio::estimate_dedup_ratio()
@@ -1455,6 +1462,220 @@ out:
   return (ret < 0) ? 1 : 0;
 }
 
+class CheckFragRatio : public CrawlerThread
+{
+  string chunk_algo;
+  string fp_algo;
+  uint64_t chunk_size;
+  uint32_t dedup_threshold;
+  map<string, tuple<uint32_t, int, uint32_t>>& fp_store;  // <fingerprint, <count, po_id, chunk_size>>
+
+  uint64_t required_read_ops = 0;
+  uint64_t num_deduped_metaobjs = 0;
+  uint64_t num_deduped_chunks = 0;
+
+public:
+  CheckFragRatio(IoCtx& ioctx, int tid, int num_threads,
+      ObjectCursor begin, ObjectCursor end, string chunk_algo, string fp_algo,
+      uint64_t chunk_size, int32_t report_period, uint64_t num_objects,
+      uint64_t dedup_threshold, map<string, tuple<uint32_t, int, uint32_t>>& fp_store)
+    : CrawlerThread(ioctx, tid, num_threads, begin, end, report_period,
+        num_objects, default_op_size), chunk_algo(chunk_algo),
+        fp_algo(fp_algo), chunk_size(chunk_size), dedup_threshold(dedup_threshold),
+        fp_store(fp_store) {}
+  virtual ~CheckFragRatio() override {}
+
+  uint64_t get_required_read_ops() {
+    return required_read_ops;
+  }
+  uint64_t get_num_deduped_metaobjs() {
+    return num_deduped_metaobjs;
+  }
+  uint64_t get_num_deduped_chunks() {
+    return num_deduped_chunks;
+  }
+
+  void check_frag_ratio() {
+    ObjectCursor shard_start, shard_end;
+    io_ctx.object_list_slice(
+      begin, end, n, m, &shard_start, &shard_end);
+
+    ObjectCursor c(shard_start);
+    while (c < shard_end) {
+      std::vector<ObjectItem> result;
+      int r = io_ctx.object_list(c, shard_end, 12, {}, &result, &c);
+      if (r < 0) {
+        cerr << "error object_list : " << cpp_strerror(r) << std::endl;
+        return;
+      }
+
+      unsigned op_size = max_read_size;
+      for (const auto & i : result) {
+        if (m_stop) {
+          return;
+        }
+
+        set<uint32_t> poids;
+        const auto &oid = i.oid;
+        //cout << n << " oid: " << oid << std::endl;
+        // read entire object
+        bufferlist bl;
+        uint64_t offset = 0;
+        while (true) {
+  bufferlist t;
+  int ret = io_ctx.read(oid, t, op_size, offset);
+  if (ret <= 0) {
+    break;
+  }
+  offset += ret;
+  bl.claim_append(t);
+        }
+        if (!bl.length()) {
+  cout << "obj: " << oid << " size is zero. continue." << std::endl;
+  continue;
+        }
+        examined_objects++;
+        examined_bytes += bl.length();
+
+        auto est = dedup_estimates.find(chunk_size);
+        if (est == dedup_estimates.end()) {
+  cerr << "dedup estimate result set error" << std::endl;
+  return;
+        }
+
+        // do chunking
+        vector<pair<uint64_t, uint64_t>> chunks;  // chunk boundaries
+        est->second.cdc->calc_chunks(bl, &chunks);
+        vector<string> fps = est->second.get_fps(bl, chunks, fp_algo);
+
+        for (uint32_t i = 0; i < fps.size(); ++i) {
+  string fp = fps[i];
+  auto it = fp_store.find(fp);
+  if (get<0>(it->second) >= dedup_threshold) {
+    //cout << "fp: " << fp << ", poid: " << get<1>(it->second) << std::endl;
+    poids.emplace(get<1>(it->second));
+    ++num_deduped_chunks;
+  }
+        }
+        cout << "oid: " << oid << " need " << poids.size() << " read operations" << std::endl;
+        if (poids.size() > 0) {
+          required_read_ops += poids.size();
+          ++num_deduped_metaobjs;
+        }
+      }
+    }
+  }
+
+  void* entry() {
+    check_frag_ratio();
+    return NULL;
+  }
+};
+
+class BuildFpStore : public CrawlerThread
+{
+  string chunk_algo;
+  string fp_algo;
+  uint64_t chunk_size;
+  map<string, tuple<uint32_t, int, uint32_t>>& fp_store;  // <fingerprint, <count, po_id, chunk_size>>
+  ceph::shared_mutex& fpstore_lock;
+
+public:
+  BuildFpStore(IoCtx& ioctx, int tid, int num_threads,
+      ObjectCursor begin, ObjectCursor end, string chunk_algo, string fp_algo,
+      uint64_t chunk_size, int32_t report_period, uint64_t num_objects,
+      map<string, tuple<uint32_t, int, uint32_t>>& fp_store, ceph::shared_mutex& fpstore_lock)
+    : CrawlerThread(ioctx, tid, num_threads, begin, end, report_period,
+        num_objects, default_op_size), chunk_algo(chunk_algo),
+        fp_algo(fp_algo), chunk_size(chunk_size), fp_store(fp_store), fpstore_lock(fpstore_lock) {}
+  virtual ~BuildFpStore() override {}
+
+  void build_fp_store() {
+    ObjectCursor shard_start, shard_end;
+    io_ctx.object_list_slice(
+      begin, end, n, m, &shard_start, &shard_end);
+
+    utime_t start = ceph_clock_now();
+    utime_t end;
+    utime_t next_report;
+    if (report_period) {
+      next_report = start;
+      next_report += report_period;
+    }
+
+    ObjectCursor c(shard_start);
+    while (c < shard_end) {
+      std::vector<ObjectItem> result;
+      int r = io_ctx.object_list(c, shard_end, 12, {}, &result, &c);
+      if (r < 0) {
+        cerr << "error object_list : " << cpp_strerror(r) << std::endl;
+        return;
+      }
+
+      unsigned op_size = max_read_size;
+      for (const auto & i : result) {
+        if (m_stop) {
+          return;
+        }
+
+        const auto &oid = i.oid;
+        //cout << n << " oid: " << oid << std::endl;
+        // read entire object
+        bufferlist bl;
+        uint64_t offset = 0;
+        while (true) {
+  bufferlist t;
+  int ret = io_ctx.read(oid, t, op_size, offset);
+  if (ret <= 0) {
+    break;
+  }
+  offset += ret;
+  bl.claim_append(t);
+        }
+        if (!bl.length()) {
+  cout << "obj: " << oid << " size is zero. continue." << std::endl;
+  continue;
+        }
+        examined_objects++;
+        examined_bytes += bl.length();
+
+        auto est = dedup_estimates.find(chunk_size);
+        if (est == dedup_estimates.end()) {
+  cerr << "dedup estimate result set error" << std::endl;
+  return;
+        }
+
+        // do chunking
+        vector<pair<uint64_t, uint64_t>> chunks;  // chunk boundaries
+        est->second.cdc->calc_chunks(bl, &chunks);
+        vector<string> fps = est->second.get_fps(bl, chunks, fp_algo);
+
+        for (uint32_t i = 0; i < fps.size(); ++i) {
+  string fp = fps[i];
+  uint64_t length = chunks[i].second;
+  //cout << "fp: " << fp << ", length: " << length << std::endl;
+  unique_lock fpl{fpstore_lock};
+  auto it = fp_store.find(fp);
+  // update fp count
+  if (it != fp_store.end()) {
+    ++(get<0>(it->second));
+  } else {
+    fp_store.emplace(fp, make_tuple(1, -1, length));
+  }
+  fpl.unlock();
+        }
+        //cout << "fp_store.size(): " << fp_store.size() << std::endl;
+      }
+    }
+  }
+
+  void* entry() {
+    build_fp_store();
+    return NULL;
+  }
+
+};
+
 class EstimateFragmentationRatio : public CrawlerThread
 {
   shared_ptr<Packer> packer;
@@ -1519,7 +1740,7 @@ public:
       unsigned op_size = max_read_size;
       for (const auto & i : result) {
         const auto &oid = i.oid;
-        if (m_stop) {
+        if (m_stop || stop_all) {
           return;
         }
 
@@ -1545,10 +1766,24 @@ public:
   cerr << "read ops to get scanned metadata objs: " << total_read_ops << std::endl;
   cerr << "the number of packed chunks: " << num_deduped_chunks << std::endl;
   cerr << "the number of deduped metadata objs: " << num_deduped_metaobjs << std::endl;
-  cerr << "avg read ops: " << total_read_ops / (double) num_deduped_metaobjs << std::endl;
+  double frag_ratio = total_read_ops / (double) num_deduped_metaobjs;
+  cerr << "avg read ops: " << frag_ratio << std::endl;
 
   next_report = now;
   next_report += report_period;
+
+  uint64_t examined_objs = 0;
+  for (auto &et : estimate_threads) {
+    examined_objs += et->get_examined_objects();
+  }
+  cout << " estimate objs: " << examined_objs << std::endl;
+  //if (prev_frag_ratio == frag_ratio && examined_objs >= 1300000) {
+    //cout << "estimation done" << std::endl;
+    //m_stop = true;
+    //stop_all = true;
+    //return;
+  //}
+  prev_frag_ratio = frag_ratio;
         }
 
         // read entire object
@@ -1562,6 +1797,9 @@ public:
   }
   offset += ret;
   bl.claim_append(t);
+        }
+        if (!bl.length()) {
+  continue;
         }
         examined_objects++;
         examined_bytes += bl.length();
@@ -1643,6 +1881,31 @@ public:
     return NULL;
   }
 };
+
+void do_fp_packing(uint64_t dedup_threshold, uint64_t pack_obj_size,
+    map<string, tuple<uint32_t, int, uint32_t>>& fp_store)
+{
+  uint32_t po_id = 0;
+  uint32_t po_size = 0;
+  //cout << "dedup_threshold: " << dedup_threshold << ", pack object size: " << pack_obj_size << std::endl;
+
+  for (auto& it : fp_store) {
+    if (stop_all) {
+      return;
+    }
+    string fp = it.first;
+    if (dedup_threshold < get<0>(fp_store[fp])) {
+      get<1>(fp_store[fp]) = po_id;
+      po_size += get<2>(fp_store[fp]);
+      //cout << "size : " << get<2>(fp_store[fp]) << std::endl;
+      if (po_size >= pack_obj_size) {
+       ++po_id;
+       po_size = 0;
+      }
+    }
+    //cout << "fp: " << fp << ", count: " << get<0>(fp_store[fp]) << ", poid: " << get<1>(fp_store[fp]) << ", po_size: " << po_size << std::endl;
+  }
+}
 
 int estimate_fragmentation(const po::variables_map &opts)
 {
@@ -1767,46 +2030,105 @@ int estimate_fragmentation(const po::variables_map &opts)
         max_apo_entries, bv_len, similarity_threshold);
   }
 
-  for (int i = 0; i < num_threads; ++i) {
-    std::unique_ptr<EstimateFragmentationRatio> ptr (
-      new EstimateFragmentationRatio(io_ctx, i, num_threads, begin, end,
-        chunk_algo, fp_algo, chunk_size, report_period, s.num_objects,
-        dedup_threshold, packer));
-    ptr->create("frag estimate");
-    ptr->set_debug(debug);
-    estimate_threads.push_back(std::move(ptr));
-  }
-  glock.unlock();
+  if (packer_type == "fp") {
+    map<string, tuple<uint32_t, int, uint32_t>> fp_store; // <fp, <count, po_id, chunk_size>>
+    ceph::shared_mutex fpstore_lock = ceph::make_shared_mutex("fpstore lock");
+    cout << "fpstore addr: " << &fp_store << std::endl;
+    cout << "mutex  addr: " << &fpstore_lock << std::endl;
+    fp_store["test"] = make_tuple<uint32_t, int, uint32_t>(1, -1, 0);
+    for (int i = 0; i < num_threads; ++i) {
+      std::unique_ptr<CrawlerThread> ptr (
+        new BuildFpStore(io_ctx, i, num_threads, begin, end,
+          chunk_algo, fp_algo, chunk_size, report_period, s.num_objects, fp_store, fpstore_lock));
+      ptr->create("frag-estimate");
+      ptr->set_debug(debug);
+      estimate_threads.push_back(std::move(ptr));
+    }
+    glock.unlock();
+    
+    for (auto& p : estimate_threads) {
+      p->join();
+    }
 
-  for (auto& p : estimate_threads) {
-    p->join();
-  }
-  cout << "all threads dead" << std::endl;
+    cout << "Build FpStore done" << std::endl;
+    cout << "fp_store size: " << fp_store.size() << std::endl;
+    //cout << "fp_store: " << fp_store << std::endl;
 
+    do_fp_packing(dedup_threshold, pack_obj_size, fp_store);
+
+    for (int i = 0; i < num_threads; ++i) {
+      std::unique_ptr<CrawlerThread> ptr(
+        new CheckFragRatio(io_ctx, i, num_threads, begin, end, chunk_algo,
+          fp_algo, chunk_size, report_period, s.num_objects, dedup_threshold, fp_store));
+        ptr->create("check-ratio");
+        ptr->set_debug(debug);
+        check_threads.push_back(std::move(ptr));
+    }
+
+    for (auto& p : check_threads) {
+      p->join();
+    }
+    cout << "check fragmentation ratio done" << std::endl;
+
+    // print fragmentation info
+    uint64_t total_read_ops = 0;
+    uint64_t num_deduped_metaobjs = 0;
+    uint64_t num_deduped_chunks = 0;
+    for (auto& et : check_threads) {
+      total_read_ops
+        += static_cast<CheckFragRatio*>(et.get())->get_required_read_ops();
+      num_deduped_metaobjs
+        += static_cast<CheckFragRatio*>(et.get())->get_num_deduped_metaobjs();
+      num_deduped_chunks
+        += static_cast<CheckFragRatio*>(et.get())->get_num_deduped_chunks();
+    }
+    cerr << "num deduped metadata objs: " << num_deduped_metaobjs << std::endl;
+    cerr << "read ops to get scanned metadata objs: " << total_read_ops << std::endl;
+    cerr << "the number of deduped metadata objs: " << num_deduped_metaobjs << std::endl;
+    cerr << "the number of deduped chunks: " << num_deduped_chunks << std::endl;
+    cerr << "avg read ops: " << total_read_ops / (double) num_deduped_metaobjs << std::endl;
+  } else {
+    for (int i = 0; i < num_threads; ++i) {
+      std::unique_ptr<EstimateFragmentationRatio> ptr (
+        new EstimateFragmentationRatio(io_ctx, i, num_threads, begin, end,
+          chunk_algo, fp_algo, chunk_size, report_period, s.num_objects,
+          dedup_threshold, packer));
+      ptr->create("frag estimate");
+      ptr->set_debug(debug);
+      estimate_threads.push_back(std::move(ptr));
+    }
+    glock.unlock();
+
+    for (auto& p : estimate_threads) {
+      p->join();
+    }
+    cout << "all threads dead" << std::endl;
+
+    // print fragmentation info
+    uint64_t total_read_ops = 0;
+    uint64_t num_deduped_chunks= 0;
+    uint64_t num_deduped_metaobjs = 0;
+    for (auto& et : estimate_threads) {
+      total_read_ops
+        += static_cast<EstimateFragmentationRatio*>(et.get())->get_required_read_ops();
+      num_deduped_chunks
+        += static_cast<EstimateFragmentationRatio*>(et.get())->get_num_deduped_chunks();
+      num_deduped_metaobjs
+        += static_cast<EstimateFragmentationRatio*>(et.get())->get_num_deduped_metaobjs();
+    }
+    cerr << "num deduped metadata objs: " << num_deduped_metaobjs << std::endl;
+    cerr << "read ops to get scanned metadata objs: " << total_read_ops << std::endl;
+    cerr << "the number of packed chunks: " << num_deduped_chunks << std::endl;
+    cerr << "the number of deduped metadata objs: " << num_deduped_metaobjs << std::endl;
+    cerr << "avg read ops: " << total_read_ops / (double) num_deduped_metaobjs << std::endl;
+
+    // print bloom filter memory usage size
+    bloom_filter tmp_bf(1, bv_len, 0, pack_obj_size / chunk_size * 10);
+    cerr << "bit vector size : " << tmp_bf.size() / CHAR_BIT << ", bloom_filter size: "
+      << sizeof(tmp_bf) << std::endl;
+  }
   print_dedup_estimate(cerr, chunk_algo);
   cout << "print dedup estimate done" << std::endl;
-  // print fragmentation info
-  uint64_t total_read_ops = 0;
-  uint64_t num_deduped_chunks= 0;
-  uint64_t num_deduped_metaobjs = 0;
-  for (auto& et : estimate_threads) {
-    total_read_ops
-      += static_cast<EstimateFragmentationRatio*>(et.get())->get_required_read_ops();
-    num_deduped_chunks
-      += static_cast<EstimateFragmentationRatio*>(et.get())->get_num_deduped_chunks();
-    num_deduped_metaobjs
-      += static_cast<EstimateFragmentationRatio*>(et.get())->get_num_deduped_metaobjs();
-  }
-  cerr << "num deduped metadata objs: " << num_deduped_metaobjs << std::endl;
-  cerr << "read ops to get scanned metadata objs: " << total_read_ops << std::endl;
-  cerr << "the number of packed chunks: " << num_deduped_chunks << std::endl;
-  cerr << "the number of deduped metadata objs: " << num_deduped_metaobjs << std::endl;
-  cerr << "avg read ops: " << total_read_ops / (double) num_deduped_metaobjs << std::endl;
-
-  // print bloom filter memory usage size
-  bloom_filter tmp_bf(1, bv_len, 0, pack_obj_size / chunk_size * 10);
-  cerr << "bit vector size : " << tmp_bf.size() / CHAR_BIT << ", bloom_filter size: "
-    << sizeof(tmp_bf) << std::endl;
 
   return 0;
 }
