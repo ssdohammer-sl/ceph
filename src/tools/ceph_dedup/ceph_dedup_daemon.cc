@@ -290,7 +290,11 @@ private:
     ObjectCursor end,
     size_t max_object_count);
   std::vector<size_t> sample_object(size_t count);
-  void try_dedup_and_accumulate_result(ObjectItem &object, snap_t snap = 0);
+  void try_dedup_and_accumulate_result(
+      ObjectItem &object,
+      bool deduped,
+      bool archived,
+      snap_t snap = 0);
   int do_chunk_dedup(chunk_t &chunk, snap_t snap);
   bufferlist read_object(ObjectItem &object);
   std::vector<std::tuple<bufferlist, pair<uint64_t, uint64_t>>> do_cdc(
@@ -298,6 +302,9 @@ private:
     bufferlist &data);
   std::string generate_fingerprint(bufferlist chunk_data);
   AioCompRef do_async_evict(string oid);
+  bool is_hot(ObjectItem& object, bool& deduped, bool& archived);
+  int make_object_archive(ObjectItem& object, bufferlist& data, snap_t snap);
+  int clear_manifest(string oid);
 
   IoCtx io_ctx;
   IoCtx chunk_io_ctx;
@@ -330,22 +337,27 @@ void SampleDedupWorkerThread::crawl()
     auto sampled_indexes = sample_object(objects.size());
     for (size_t index : sampled_indexes) {
       ObjectItem target = objects[index];
-      if (snap) {
-	io_ctx.snap_set_read(librados::SNAP_DIR);
-	snap_set_t snap_set;
-	int snap_ret;
-	ObjectReadOperation op;
-	op.list_snaps(&snap_set, &snap_ret);
-	io_ctx.operate(target.oid, &op, NULL);
 
-	for (vector<librados::clone_info_t>::const_iterator r = snap_set.clones.begin();
-	  r != snap_set.clones.end();
-	  ++r) {
-	  io_ctx.snap_set_read(r->cloneid);
-	  try_dedup_and_accumulate_result(target, r->cloneid);
-	}
-      } else {
-	try_dedup_and_accumulate_result(target);
+      bool deduped = false;
+      bool archived = false;
+      if (!is_hot(target, deduped, archived))  {
+  if (snap) {
+    io_ctx.snap_set_read(librados::SNAP_DIR);
+    snap_set_t snap_set;
+    int snap_ret;
+    ObjectReadOperation op;
+    op.list_snaps(&snap_set, &snap_ret);
+    io_ctx.operate(target.oid, &op, NULL);
+
+    for (vector<librados::clone_info_t>::const_iterator r = snap_set.clones.begin();
+      r != snap_set.clones.end();
+      ++r) {
+      io_ctx.snap_set_read(r->cloneid);
+      try_dedup_and_accumulate_result(target, deduped, archived, r->cloneid);
+    }
+  } else {
+    try_dedup_and_accumulate_result(target, deduped, archived);
+  }
       }
       l.lock();
       if (all_stop) {
@@ -421,8 +433,29 @@ std::vector<size_t> SampleDedupWorkerThread::sample_object(size_t count)
   return indexes;
 }
 
+int SampleDedupWorkerThread::clear_manifest(string oid)
+{
+  ObjectWriteOperation promote_op;
+  promote_op.tier_promote();
+  int ret = 0;
+
+  ret = io_ctx.operate(oid, &promote_op);
+  if (ret < 0) {
+    derr << "tier_promote failed " << oid << dendl;
+    return ret;
+  }
+
+  ObjectWriteOperation unset_op;
+  unset_op.unset_manifest();
+  ret = io_ctx.operate(oid, &unset_op);
+  if (ret < 0) {
+    derr << "unset_manifest failed " << oid << dendl;
+  }
+  return ret;
+}
+
 void SampleDedupWorkerThread::try_dedup_and_accumulate_result(
-  ObjectItem &object, snap_t snap)
+  ObjectItem &object, bool deduped, bool archived, snap_t snap)
 {
   bufferlist data = read_object(object);
   if (data.length() == 0) {
@@ -469,18 +502,29 @@ void SampleDedupWorkerThread::try_dedup_and_accumulate_result(
 
     if (sample_dedup_global.fp_store.add(chunk_info)) {
       redundant_chunks.push_back(chunk_info);
-      dout(20) << chunk_info.fingerprint << "is duplicated, try to perform dedup" << dendl;
     }
   }
 
   size_t object_size = data.length();
-
-  // perform chunk-dedup
-  for (auto &p : redundant_chunks) {
-    do_chunk_dedup(p, snap);
+  if (!redundant_chunks.empty()) {
+    // perform chunk-dedup
+    if (archived) {
+      dout(20) << object.oid << " is changed from archived to dedup" << dendl;
+      if (clear_manifest(object.oid) < 0) {
+        return;
+      }
+    }
+    for (auto &p : redundant_chunks) {
+      do_chunk_dedup(p, snap);
+      dout(20) << p.fingerprint << " deduped" << dendl;
+    }
+    total_duplicated_size += duplicated_size;
+    total_object_size += object_size;
+  } else if (!archived && !deduped) {
+    // perform object migration
+    make_object_archive(object, data, snap);
+    dout(20) << object.oid << " is cold and unique. Moved to cold pool" << dendl;
   }
-  total_duplicated_size += duplicated_size;
-  total_object_size += object_size;
 }
 
 bufferlist SampleDedupWorkerThread::read_object(ObjectItem &object)
@@ -552,7 +596,6 @@ int SampleDedupWorkerThread::do_chunk_dedup(chunk_t &chunk, snap_t snap)
   time_t mtime;
 
   int ret = chunk_io_ctx.stat(chunk.fingerprint, &size, &mtime);
-
   if (ret == -ENOENT) {
     bufferlist bl;
     bl.append(chunk.data);
@@ -573,6 +616,51 @@ int SampleDedupWorkerThread::do_chunk_dedup(chunk_t &chunk, snap_t snap)
       CEPH_OSD_OP_FLAG_WITH_REFERENCE);
   ret = io_ctx.operate(chunk.oid, &op, nullptr);
   oid_for_evict.insert(make_pair(chunk.oid, snap));
+  return ret;
+}
+
+bool SampleDedupWorkerThread::is_hot(ObjectItem& object,
+    bool& deduped, bool& archived)
+{
+  ObjectReadOperation op;
+  bool hot = false;
+  int ret = -1;
+
+  op.is_hot(&hot, &deduped, &archived, &ret);
+  io_ctx.operate(object.oid, &op, NULL);
+  if (ret < 0) {
+    derr << "get " << object.oid << " temperature failed"
+      << dendl;
+    // return true to avoid dedup
+    return true;
+  }
+  dout(20) << object.oid << " hot=" << hot << ", deduped=" << deduped
+    << ", archived=" << deduped << dendl;
+
+  return hot;
+}
+
+int SampleDedupWorkerThread::make_object_archive(ObjectItem& object,
+	bufferlist& data, snap_t snap) {
+  ObjectWriteOperation wop;
+  wop.write_full(data);
+  int ret = chunk_io_ctx.operate(object.oid, &wop);
+  if (ret < 0) {
+    derr << "write_full " << object.oid << " failed: "
+      << cpp_strerror(ret) << dendl;
+    return ret;
+  }
+
+  ObjectReadOperation rop;
+  rop.set_chunk(0, data.length(), chunk_io_ctx, object.oid, 0,
+      CEPH_OSD_OP_FLAG_WITH_REFERENCE);
+  ret = io_ctx.operate(object.oid, &rop, NULL);
+  if (ret < 0) {
+    derr << object.oid << " set_chunk failed: " << cpp_strerror(ret) << dendl;
+    return ret;
+  }
+  oid_for_evict.emplace(make_pair(object.oid, snap));
+
   return ret;
 }
 

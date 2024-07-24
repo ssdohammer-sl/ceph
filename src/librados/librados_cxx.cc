@@ -638,6 +638,16 @@ void librados::ObjectReadOperation::tier_evict()
   o->tier_evict();
 }
 
+void librados::ObjectReadOperation::is_hot(bool *is_hot,
+              bool *deduped,
+              bool *archived,
+              int *prval)
+{
+  ceph_assert(impl);
+  ::ObjectOperation *o = &impl->o;
+  o->is_hot(is_hot, deduped, archived, prval);
+}
+
 void librados::ObjectWriteOperation::set_redirect(const std::string& tgt_obj, 
 						  const IoCtx& tgt_ioctx,
 						  uint64_t tgt_version,

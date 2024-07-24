@@ -770,6 +770,16 @@ inline namespace v14_2_0 {
      * updates.
      */
     void tier_evict();
+
+    /**
+     * query an object is hot or not
+     *
+     * @param is_hot    [out] pointer to resulting whether an object is hot
+     * @param deduped   [out] pointer to resulting whether an object is deduped
+     * @param archived  [out] pointer to resulting whether an object is archived
+     * @param prval     [out] place error code in prval upon completion
+     */
+    void is_hot(bool *is_hot, bool *deduped, bool *archived, int *prval);
   };
 
   /* IoCtx : This is a context in which we can perform I/O.

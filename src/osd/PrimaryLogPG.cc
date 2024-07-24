@@ -2285,6 +2285,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     m->get_snapid() == CEPH_SNAPDIR ? head : m->get_hobj();
 
   // make sure LIST_SNAPS is on CEPH_SNAPDIR and nothing else
+  bool skip_hit_set = false;
   for (vector<OSDOp>::iterator p = m->ops.begin(); p != m->ops.end(); ++p) {
     OSDOp& osd_op = *p;
 
@@ -2300,6 +2301,18 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
 	osd->reply_op_error(op, -EINVAL);
 	return;
       }
+    }
+
+    // TODO find better way
+    // not to insert object info in hit-set
+    if (osd_op.op.op == CEPH_OSD_OP_ISHOT
+        || osd_op.op.op == CEPH_OSD_OP_SET_CHUNK
+        || osd_op.op.op == CEPH_OSD_OP_TIER_FLUSH
+        || osd_op.op.op == CEPH_OSD_OP_TIER_EVICT
+        || osd_op.op.op == CEPH_OSD_OP_STAT) {
+      dout(20) << "op(" << ceph_osd_op_name(osd_op.op.op) << " oid: " << oid
+        << " from ceph-dedup-daemon" << dendl;
+      skip_hit_set = true;
     }
   }
 
@@ -2371,8 +2384,15 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
         in_hit_set = true;
     }
     if (!op->hitset_inserted) {
-      hit_set->insert(oid);
-      op->hitset_inserted = true;
+      if (!skip_hit_set) {
+  hit_set->insert(oid);
+  dout(20) << __func__ << " hit_set_inserted true " << oid
+    << " hit_set_start_stamp: " << hit_set_start_stamp << " period: "
+    << pool.info.hit_set_period << " recv stamp: " << m->get_recv_stamp()
+    << dendl;
+  op->hitset_inserted = true;
+      }
+
       if (hit_set->is_full() ||
           hit_set_start_stamp + pool.info.hit_set_period <= m->get_recv_stamp()) {
         hit_set_persist();
@@ -2550,14 +2570,27 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
   vector<OSDOp> ops = op->get_req<MOSDOp>()->ops;
   for (vector<OSDOp>::iterator p = ops.begin(); p != ops.end(); ++p) {
     OSDOp& osd_op = *p;
-    ceph_osd_op& op = osd_op.op;
-    if (op.op == CEPH_OSD_OP_SET_REDIRECT ||
-	op.op == CEPH_OSD_OP_SET_CHUNK ||
-	op.op == CEPH_OSD_OP_UNSET_MANIFEST ||
-	op.op == CEPH_OSD_OP_TIER_PROMOTE ||
-	op.op == CEPH_OSD_OP_TIER_FLUSH ||
-	op.op == CEPH_OSD_OP_TIER_EVICT ||
-	op.op == CEPH_OSD_OP_ISDIRTY) {
+    ceph_osd_op& coop = osd_op.op;
+    if (coop.op == CEPH_OSD_OP_SET_REDIRECT ||
+	coop.op == CEPH_OSD_OP_SET_CHUNK ||
+	coop.op == CEPH_OSD_OP_UNSET_MANIFEST ||
+	coop.op == CEPH_OSD_OP_TIER_PROMOTE ||
+	coop.op == CEPH_OSD_OP_TIER_FLUSH ||
+	coop.op == CEPH_OSD_OP_TIER_EVICT ||
+	coop.op == CEPH_OSD_OP_ISDIRTY ||
+  coop.op == CEPH_OSD_OP_ISHOT) {
+      if (coop.op == CEPH_OSD_OP_SET_CHUNK) {
+  if (!hit_set) {
+    hit_set_setup();
+  }
+  if (agent_state) {
+    if (agent_choose_mode(false, op)) {
+      return cache_result_t::NOOP;
+    }
+  } else {
+    agent_setup();
+  }
+      }
       return cache_result_t::NOOP;
     }
   }
@@ -6249,6 +6282,45 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	encode(is_dirty, osd_op.outdata);
 	ctx->delta_stats.num_rd++;
 	result = 0;
+      }
+      break;
+
+    case CEPH_OSD_OP_ISHOT:
+      ++ctx->num_read;
+      {
+  bool is_hot = hit_set->contains(oi.soid);
+  if (hit_set && !is_hot) {
+    // search hit_set_map to find soid
+    for (auto iter = agent_state->hit_set_map.crbegin();
+         iter != agent_state->hit_set_map.crend();
+         ++iter) {
+      if (iter->second->contains(soid)) {
+        is_hot = true;
+        break;
+      }
+    }
+  }
+
+  bool deduped = false;
+  bool archived = false;
+  if (obs.oi.has_manifest() && obs.oi.manifest.is_chunked()) {
+    // check object is deduped or archived
+    auto p = obs.oi.manifest.chunk_map.find(0);
+    if (p != obs.oi.manifest.chunk_map.end() &&
+        obs.oi.soid.oid.name == obs.oi.manifest.chunk_map[0].oid.oid.name) {
+      archived = true;
+    } else if (!archived && obs.oi.manifest.chunk_map.size() > 0) {
+      deduped = true;
+    }
+  }
+
+  dout(20) << "OP_ISHOT " << oi.soid << " is_hot=" << is_hot
+    << ", deduped=" << deduped << ", archived=" << archived<< dendl;
+  
+  encode(is_hot, osd_op.outdata);
+  encode(deduped, osd_op.outdata);
+  encode(archived, osd_op.outdata);
+  result = 0;
       }
       break;
 
@@ -14794,15 +14866,25 @@ void PrimaryLogPG::hit_set_in_memory_trim(uint32_t max_in_memory)
 void PrimaryLogPG::agent_setup()
 {
   ceph_assert(is_locked());
-  if (!is_active() ||
-      !is_primary() ||
-      state_test(PG_STATE_PREMERGE) ||
-      pool.info.cache_mode == pg_pool_t::CACHEMODE_NONE ||
-      pool.info.tier_of < 0 ||
-      !get_osdmap()->have_pg_pool(pool.info.tier_of)) {
-    agent_clear();
-    return;
+  if (pool.info.get_dedup_tier() > 0) {
+    if (!is_active() ||
+        !is_primary() ||
+        state_test(PG_STATE_PREMERGE)) {
+      agent_clear();
+      return;
+    }
+  } else {
+    if (!is_active() ||
+        !is_primary() ||
+        state_test(PG_STATE_PREMERGE) ||
+        pool.info.cache_mode == pg_pool_t::CACHEMODE_NONE ||
+        pool.info.tier_of < 0 ||
+        !get_osdmap()->have_pg_pool(pool.info.tier_of)) {
+      agent_clear();
+      return;
+    }
   }
+
   if (!agent_state) {
     agent_state.reset(new TierAgentState);
 
@@ -14863,7 +14945,9 @@ bool PrimaryLogPG::agent_work(int start_max, int agent_flush_quota)
   agent_load_hit_sets();
 
   const pg_pool_t *base_pool = get_osdmap()->get_pg_pool(pool.info.tier_of);
-  ceph_assert(base_pool);
+  if (pool.info.get_dedup_tier() <= 0) {
+    ceph_assert(base_pool);
+  }
 
   int ls_min = 1;
   int ls_max = cct->_conf->osd_pool_default_cache_max_evict_check_size;
@@ -14928,20 +15012,22 @@ bool PrimaryLogPG::agent_work(int start_max, int agent_flush_quota)
     }
 
     // be careful flushing omap to an EC pool.
-    if (!base_pool->supports_omap() &&
+    if (pool.info.get_dedup_tier() <= 0 && !base_pool->supports_omap() &&
 	obc->obs.oi.is_omap()) {
       dout(20) << __func__ << " skip (omap to EC) " << obc->obs.oi << dendl;
       osd->logger->inc(l_osd_agent_skip);
       continue;
     }
 
-    if (agent_state->evict_mode != TierAgentState::EVICT_MODE_IDLE &&
-	agent_maybe_evict(obc, false))
-      ++started;
-    else if (agent_state->flush_mode != TierAgentState::FLUSH_MODE_IDLE &&
-             agent_flush_quota > 0 && agent_maybe_flush(obc)) {
-      ++started;
-      --agent_flush_quota;
+    if (pool.info.get_dedup_tier() <= 0) {
+      if (agent_state->evict_mode != TierAgentState::EVICT_MODE_IDLE &&
+    agent_maybe_evict(obc, false))
+        ++started;
+      else if (agent_state->flush_mode != TierAgentState::FLUSH_MODE_IDLE &&
+               agent_flush_quota > 0 && agent_maybe_flush(obc)) {
+        ++started;
+        --agent_flush_quota;
+      }
     }
     if (started >= start_max) {
       // If finishing early, set "next" to the next object
@@ -15274,9 +15360,11 @@ bool PrimaryLogPG::agent_choose_mode(bool restart, OpRequestRef op)
 
   // also exclude omap objects if ec backing pool
   const pg_pool_t *base_pool = get_osdmap()->get_pg_pool(pool.info.tier_of);
-  ceph_assert(base_pool);
-  if (!base_pool->supports_omap())
-    unflushable += info.stats.stats.sum.num_objects_omap;
+  if (pool.info.get_dedup_tier() <= 0) {
+    ceph_assert(base_pool);
+    if (!base_pool->supports_omap())
+      unflushable += info.stats.stats.sum.num_objects_omap;
+  }
 
   uint64_t num_user_objects = info.stats.stats.sum.num_objects;
   if (num_user_objects > unflushable)
@@ -15292,7 +15380,7 @@ bool PrimaryLogPG::agent_choose_mode(bool restart, OpRequestRef op)
 
   // also reduce the num_dirty by num_objects_omap
   int64_t num_dirty = info.stats.stats.sum.num_objects_dirty;
-  if (!base_pool->supports_omap()) {
+  if (pool.info.get_dedup_tier() <= 0 && !base_pool->supports_omap()) {
     if (num_dirty > info.stats.stats.sum.num_objects_omap)
       num_dirty -= info.stats.stats.sum.num_objects_omap;
     else
@@ -15454,6 +15542,10 @@ bool PrimaryLogPG::agent_choose_mode(bool restart, OpRequestRef op)
 	return false;
       });
     agent_state->evict_mode = evict_mode;
+  }
+  if (pool.info.get_dedup_tier() > 0) {
+    // for ceph-dedup-daemon hot/cold detection
+    agent_state->evict_mode = TierAgentState::EVICT_MODE_SOME;
   }
   uint64_t old_effort = agent_state->evict_effort;
   if (evict_effort != agent_state->evict_effort) {
