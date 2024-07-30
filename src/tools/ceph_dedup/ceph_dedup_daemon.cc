@@ -21,6 +21,7 @@ po::options_description make_usage() {
     ("chunk-algorithm", po::value<std::string>(), ": <fixed|fastcdc>, set chunk-algorithm")
     ("fingerprint-algorithm", po::value<std::string>(), ": <sha1|sha256|sha512>, set fingerprint-algorithm")
     ("chunk-pool", po::value<std::string>(), ": set chunk pool name")
+    ("index-pool", po::value<std::string>(), ": set index pool name")
     ("max-thread", po::value<int>(), ": set max thread")
     ("report-period", po::value<int>(), ": set report-period")
     ("pool", po::value<std::string>(), ": set pool name")
@@ -29,6 +30,7 @@ po::options_description make_usage() {
     ("sampling-ratio", po::value<int>(), ": set the sampling ratio (percentile)")
     ("wakeup-period", po::value<int>(), ": set the wakeup period of crawler thread (sec)")
     ("fpstore-threshold", po::value<size_t>()->default_value(100_M), ": set max size of in-memory fingerprint store (bytes)")
+    ("pack-obj-size", po::value<size_t>()->default_value(4_M), ": set pack object size (bytes)")
     ("run-once", ": do a single iteration for debug")
   ;
   desc.add(op_desc);
@@ -234,21 +236,140 @@ public:
     FpMap<std::string, dup_count_t> fp_map; // Accessed in the worker threads under fingerprint_lock
   };
 
+  class Packer {
+    size_t max_po_size;
+    size_t po_size = 0; // Accessed in the worker threads under po_lock
+    string poid = string(); // Accessed in the worker threads under po_lock
+    std::shared_mutex po_lock;
+    const string PO_PREFIX = "po_";
+    const string CHUNK_LOC_ATTR = "chunk_location";
+
+  public:
+    Packer() = delete;
+    Packer(const Packer&) = delete;
+    Packer& operator=(const Packer&) = delete;
+
+    Packer(const size_t max_po_size) : 
+      max_po_size(max_po_size) {}
+    //Packer(Packer&& packer) :
+      //max_po_size(packer.max_po_size) {}
+
+    void pack_chunk(IoCtx& io_ctx, IoCtx& chunk_io_ctx, IoCtx& index_io_ctx,
+        chunk_t chunk) {
+      int ret;
+      std::unique_lock pl(po_lock);
+      // check pack object is available
+      if (poid.empty() || po_size >= max_po_size) {
+  poid = PO_PREFIX + chunk.fingerprint;
+  if (create_pack_object(chunk_io_ctx) < 0) {
+    return;
+  }
+  po_size = 0;
+      }
+
+      // check whether the chunk is deduped
+      // if chunk is deduped, return its location (poid and offset)
+      pair<string, int> chunk_loc = check_packed(index_io_ctx, chunk.fingerprint);
+      int chunk_offset = chunk_loc.second;
+      if (chunk_loc.first.empty()) {
+  chunk_offset = po_size;
+
+  // append chunk data to the pack object
+  ret = chunk_io_ctx.write(poid, chunk.data, chunk.size, chunk_offset);
+  if (ret < 0) {
+    derr << "append chunk data to " << poid << " failed: " << cpp_strerror(ret) << dendl;
+    return;
+  }
+  po_size += chunk.size;
+
+  if (create_chunk_metadata_object(index_io_ctx, chunk.fingerprint, chunk_offset) < 0) {
+    return;
+  }
+      }
+
+      ObjectReadOperation rop;
+      rop.set_packed_chunk(chunk.start, chunk.size, chunk_io_ctx,
+          poid, chunk_offset, index_io_ctx, chunk.fingerprint,
+          CEPH_OSD_OP_FLAG_WITH_REFERENCE);
+      ret = io_ctx.operate(chunk.oid, &rop, NULL);
+      if (ret < 0) {
+  derr << chunk.fingerprint << " already set-packed-chunked. srd oid: "
+    << chunk.oid << ", poid: " << poid << ", po offset: " << po_size 
+    << dendl;
+  return;
+      }
+    }
+
+  private:
+    pair<string, int> check_packed(IoCtx& index_io_ctx, string fp) {
+      bufferlist bl;
+      int ret = index_io_ctx.getxattr(fp, CHUNK_LOC_ATTR.c_str(), bl);
+      if (ret == -ENOENT) {
+  dout(5) << "fp: " << fp << " is not deduped" << dendl;
+  return make_pair(string(), 0);
+      }
+
+      pair<string, uint32_t> chunk_loc;
+      try {
+  auto iter = bl.cbegin();
+  decode(chunk_loc, iter);
+      } catch (buffer::error& err) {
+  dout(5) << "get deduped location of " << fp << " failed " << dendl;
+  return make_pair(string(), 0);
+      }
+      return chunk_loc;
+    }
+
+    int create_pack_object(IoCtx& chunk_io_ctx) {
+      bufferlist bl;
+      int ret = chunk_io_ctx.write_full(poid, bl);
+      if (ret < 0) {
+        derr << "create pack object (" << poid << ") failed: " << cpp_strerror(ret)
+          << dendl;
+      }
+      return ret;
+    }
+
+    int create_chunk_metadata_object(IoCtx& index_io_ctx, string fp, int chunk_offset) {
+      bufferlist bl;
+      int ret = index_io_ctx.write_full(fp, bl);
+      if (ret < 0) {
+        derr << "create chunk metadata object (" << fp << ") failed: "
+          << cpp_strerror(ret) << dendl;
+        return ret;
+      }
+
+      // do setxattr to update chunk location
+      bufferlist loc;
+      encode(make_pair(poid, chunk_offset), loc);
+      ret = index_io_ctx.setxattr(fp, CHUNK_LOC_ATTR.c_str(), loc);
+      if (ret < 0) {
+        derr << "setxattr chunk metadata object (" << fp << ") failed: "
+          << cpp_strerror(ret) << dendl;
+      }
+      return ret;
+    }
+  };
+
   struct SampleDedupGlobal {
     FpStore fp_store;
+    Packer packer;
     const double sampling_ratio = -1;
     SampleDedupGlobal(
       size_t chunk_threshold,
       int sampling_ratio,
       uint32_t report_period,
-      size_t fpstore_threshold) :
+      size_t fpstore_threshold,
+      size_t pack_object_size) :
       fp_store(chunk_threshold, report_period, fpstore_threshold),
+      packer(pack_object_size),
       sampling_ratio(static_cast<double>(sampling_ratio) / 100) { }
   };
 
   SampleDedupWorkerThread(
     IoCtx &io_ctx,
     IoCtx &chunk_io_ctx,
+    IoCtx &index_io_ctx,
     ObjectCursor begin,
     ObjectCursor end,
     size_t chunk_size,
@@ -257,6 +378,7 @@ public:
     SampleDedupGlobal &sample_dedup_global,
     bool snap) :
     chunk_io_ctx(chunk_io_ctx),
+    index_io_ctx(index_io_ctx),
     chunk_size(chunk_size),
     fp_type(pg_pool_t::get_fingerprint_from_str(fp_algo)),
     chunk_algo(chunk_algo),
@@ -295,7 +417,7 @@ private:
       bool deduped,
       bool archived,
       snap_t snap = 0);
-  int do_chunk_dedup(chunk_t &chunk, snap_t snap);
+  void do_chunk_dedup(chunk_t &chunk, snap_t snap);
   bufferlist read_object(ObjectItem &object);
   std::vector<std::tuple<bufferlist, pair<uint64_t, uint64_t>>> do_cdc(
     ObjectItem &object,
@@ -308,6 +430,7 @@ private:
 
   IoCtx io_ctx;
   IoCtx chunk_io_ctx;
+  IoCtx index_io_ctx;
   size_t total_duplicated_size = 0;
   size_t total_object_size = 0;
 
@@ -590,33 +713,11 @@ std::string SampleDedupWorkerThread::generate_fingerprint(bufferlist chunk_data)
   return ret;
 }
 
-int SampleDedupWorkerThread::do_chunk_dedup(chunk_t &chunk, snap_t snap)
+void SampleDedupWorkerThread::do_chunk_dedup(chunk_t &chunk, snap_t snap)
 {
-  uint64_t size;
-  time_t mtime;
-
-  int ret = chunk_io_ctx.stat(chunk.fingerprint, &size, &mtime);
-  if (ret == -ENOENT) {
-    bufferlist bl;
-    bl.append(chunk.data);
-    ObjectWriteOperation wop;
-    wop.write_full(bl);
-    chunk_io_ctx.operate(chunk.fingerprint, &wop);
-  } else {
-    ceph_assert(ret == 0);
-  }
-
-  ObjectReadOperation op;
-  op.set_chunk(
-      chunk.start,
-      chunk.size,
-      chunk_io_ctx,
-      chunk.fingerprint,
-      0,
-      CEPH_OSD_OP_FLAG_WITH_REFERENCE);
-  ret = io_ctx.operate(chunk.oid, &op, nullptr);
+  sample_dedup_global.packer.pack_chunk(io_ctx, chunk_io_ctx,
+      index_io_ctx, chunk);
   oid_for_evict.insert(make_pair(chunk.oid, snap));
-  return ret;
 }
 
 bool SampleDedupWorkerThread::is_hot(ObjectItem& object,
@@ -668,6 +769,7 @@ int make_crawling_daemon(const po::variables_map &opts)
 {
   string base_pool_name = get_opts_pool_name(opts);
   string chunk_pool_name = get_opts_chunk_pool(opts);
+  string index_pool_name = get_opts_index_pool(opts);
   unsigned max_thread = get_opts_max_thread(opts);
   uint32_t report_period = get_opts_report_period(opts);
   bool run_once = false; // for debug
@@ -690,6 +792,11 @@ int make_crawling_daemon(const po::variables_map &opts)
   uint32_t chunk_dedup_threshold = -1;
   if (opts.count("chunk-dedup-threshold")) {
     chunk_dedup_threshold = opts["chunk-dedup-threshold"].as<int>();
+  }
+
+  size_t pack_object_size = 4 * 1024 * 1024;
+  if (opts.count("pack-obj-size")) {
+    pack_object_size = opts["pack-obj-size"].as<size_t>();
   }
 
   std::string chunk_algo = get_opts_chunk_algo(opts);
@@ -717,7 +824,7 @@ int make_crawling_daemon(const po::variables_map &opts)
   std::string fp_algo = get_opts_fp_algo(opts);
 
   list<string> pool_names;
-  IoCtx io_ctx, chunk_io_ctx;
+  IoCtx io_ctx, chunk_io_ctx, index_io_ctx;
   pool_names.push_back(base_pool_name);
   ret = rados.ioctx_create(base_pool_name.c_str(), io_ctx);
   if (ret < 0) {
@@ -735,6 +842,14 @@ int make_crawling_daemon(const po::variables_map &opts)
     return -EINVAL;
   }
 
+  ret = rados.ioctx_create(index_pool_name.c_str(), index_io_ctx);
+  if (ret < 0) {
+    derr << "error opening index pool "
+      << index_pool_name << ": "
+      << cpp_strerror(ret) << dendl;
+    return -EINVAL;
+  }
+
   if (opts.count("run-once")) {
     run_once = true;
   }
@@ -747,6 +862,7 @@ int make_crawling_daemon(const po::variables_map &opts)
     << ", Chunk Argorithm : " << chunk_algo
     << ", Chunk Dedup Threshold : " << chunk_dedup_threshold 
     << ", Fingerprint Store Threshold : " << fp_threshold
+    << ", Pack Object Size: " << pack_object_size 
     << ")" 
     << dendl;
 
@@ -758,7 +874,7 @@ int make_crawling_daemon(const po::variables_map &opts)
     ObjectCursor end = io_ctx.object_list_end();
 
     SampleDedupWorkerThread::SampleDedupGlobal sample_dedup_global(
-      chunk_dedup_threshold, sampling_ratio, report_period, fp_threshold);
+      chunk_dedup_threshold, sampling_ratio, report_period, fp_threshold, pack_object_size);
 
     std::list<SampleDedupWorkerThread> threads;
     size_t total_size = 0;
@@ -778,6 +894,7 @@ int make_crawling_daemon(const po::variables_map &opts)
       threads.emplace_back(
 	io_ctx,
 	chunk_io_ctx,
+  index_io_ctx,
 	shard_start,
 	shard_end,
 	chunk_size,

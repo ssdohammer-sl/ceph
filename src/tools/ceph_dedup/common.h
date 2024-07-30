@@ -57,6 +57,7 @@ string get_opts_chunk_algo(const po::variables_map &opts);
 string get_opts_fp_algo(const po::variables_map &opts);
 string get_opts_op_name(const po::variables_map &opts);
 string get_opts_chunk_pool(const po::variables_map &opts);
+string get_opts_index_pool(const po::variables_map &opts);
 string get_opts_object_name(const po::variables_map &opts);
 int get_opts_max_thread(const po::variables_map &opts);
 int get_opts_report_period(const po::variables_map &opts);

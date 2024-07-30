@@ -1474,7 +1474,7 @@ protected:
   void get_adjacent_clones(ObjectContextRef src_obc, 
 			   ObjectContextRef& _l, ObjectContextRef& _g);
   bool inc_refcount_by_set(OpContext* ctx, object_manifest_t& tgt,
-			   OSDOp& osd_op);
+			   OSDOp& osd_op, hobject_t idx_oid = hobject_t());
   int do_cdc(const object_info_t& oi, std::map<uint64_t, chunk_info_t>& chunk_map,
 	     std::map<uint64_t, bufferlist>& chunks);
   int start_dedup(OpRequestRef op, ObjectContextRef obc);

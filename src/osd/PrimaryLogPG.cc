@@ -2306,6 +2306,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     // TODO find better way
     // not to insert object info in hit-set
     if (osd_op.op.op == CEPH_OSD_OP_ISHOT
+        || osd_op.op.op == CEPH_OSD_OP_SET_PACKED_CHUNK
         || osd_op.op.op == CEPH_OSD_OP_SET_CHUNK
         || osd_op.op.op == CEPH_OSD_OP_TIER_FLUSH
         || osd_op.op.op == CEPH_OSD_OP_TIER_EVICT
@@ -2573,13 +2574,15 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
     ceph_osd_op& coop = osd_op.op;
     if (coop.op == CEPH_OSD_OP_SET_REDIRECT ||
 	coop.op == CEPH_OSD_OP_SET_CHUNK ||
+  coop.op == CEPH_OSD_OP_SET_PACKED_CHUNK ||
 	coop.op == CEPH_OSD_OP_UNSET_MANIFEST ||
 	coop.op == CEPH_OSD_OP_TIER_PROMOTE ||
 	coop.op == CEPH_OSD_OP_TIER_FLUSH ||
 	coop.op == CEPH_OSD_OP_TIER_EVICT ||
 	coop.op == CEPH_OSD_OP_ISDIRTY ||
   coop.op == CEPH_OSD_OP_ISHOT) {
-      if (coop.op == CEPH_OSD_OP_SET_CHUNK) {
+      if (coop.op == CEPH_OSD_OP_SET_CHUNK ||
+          coop.op == CEPH_OSD_OP_SET_PACKED_CHUNK) {
   if (!hit_set) {
     hit_set_setup();
   }
@@ -3574,7 +3577,8 @@ bool PrimaryLogPG::recover_adjacent_clones(ObjectContextRef obc, OpRequestRef op
   for (auto& osd_op : m->ops) {
     if (osd_op.op.op == CEPH_OSD_OP_ROLLBACK) {
       return false;
-    } else if (osd_op.op.op == CEPH_OSD_OP_SET_CHUNK) {
+    } else if (osd_op.op.op == CEPH_OSD_OP_SET_CHUNK ||
+        osd_op.op.op == CEPH_OSD_OP_SET_PACKED_CHUNK) {
       has_manifest_op = true;	
       break;
     }
@@ -3648,7 +3652,7 @@ void PrimaryLogPG::get_adjacent_clones(ObjectContextRef src_obc,
 }
 
 bool PrimaryLogPG::inc_refcount_by_set(OpContext* ctx, object_manifest_t& set_chunk,
-				       OSDOp& osd_op)
+				       OSDOp& osd_op, hobject_t idx_oid)
 {
   object_ref_delta_t refs;
   ObjectContextRef obc_l, obc_g;
@@ -3677,8 +3681,19 @@ bool PrimaryLogPG::inc_refcount_by_set(OpContext* ctx, object_manifest_t& set_ch
 	auto offset = c.first;
 	auto length = c.second.length;	
 	auto* fin = new C_SetManifestRefCountDone(this, ctx->obs->oi.soid, offset);
-	ceph_tid_t tid = refcount_manifest(ctx->obs->oi.soid, target_oid,
-					    refcount_t::INCREMENT_REF, fin, std::nullopt);
+        /*
+         *  call refcount_manifest() according to the existance of idx_oid
+         *  if idx_oid is empty, inc_refcount_by_set() is called by SET_CHUNK op
+         *  if idx_oid is not empty, inc_refcount_by_set() is called by SET_PACKED_CHUNK op
+         */
+        ceph_tid_t tid;
+        if (idx_oid == hobject_t()) {
+          tid = refcount_manifest(ctx->obs->oi.soid, target_oid,
+                                  refcount_t::INCREMENT_REF, fin, std::nullopt);
+        } else {
+          tid = refcount_manifest(ctx->obs->oi.soid, idx_oid,
+                                  refcount_t::INCREMENT_REF, fin, std::nullopt);
+        }
 	fin->tid = tid;
 	mop->chunks[target_oid] = make_pair(offset, length);
 	mop->num_chunks++;
@@ -6070,6 +6085,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
     case CEPH_OSD_OP_CACHE_UNPIN:
     case CEPH_OSD_OP_SET_REDIRECT:
     case CEPH_OSD_OP_SET_CHUNK:
+    case CEPH_OSD_OP_SET_PACKED_CHUNK:
     case CEPH_OSD_OP_TIER_PROMOTE:
     case CEPH_OSD_OP_TIER_FLUSH:
     case CEPH_OSD_OP_TIER_EVICT:
@@ -7311,6 +7327,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       break;
 
     case CEPH_OSD_OP_SET_CHUNK:
+    case CEPH_OSD_OP_SET_PACKED_CHUNK:
       ++ctx->num_write;
       result = 0;
       {
@@ -7331,16 +7348,20 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  goto fail;
 	}
 
-	object_locator_t tgt_oloc;
+	object_locator_t tgt_oloc, idx_oloc;
 	uint64_t src_offset, src_length, tgt_offset;
-	object_t tgt_name;
+	object_t tgt_name, idx_name;
 	try {
 	  decode(src_offset, bp);
 	  decode(src_length, bp);
 	  decode(tgt_oloc, bp);
 	  decode(tgt_name, bp);
 	  decode(tgt_offset, bp);
-	}
+          if (op.op == CEPH_OSD_OP_SET_PACKED_CHUNK) {
+            decode(idx_oloc, bp);
+            decode(idx_name, bp);
+          }
+              }
 	catch (ceph::buffer::error& e) {
 	  result = -EINVAL;
 	  goto fail;
@@ -7401,7 +7422,19 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  object_manifest_t set_chunk;
 	  bool need_inc_ref = false;
 	  set_chunk.chunk_map[src_offset] = chunk_info;
-	  need_inc_ref = inc_refcount_by_set(ctx, set_chunk, osd_op);
+          if (op.op == CEPH_OSD_OP_SET_PACKED_CHUNK) {
+            pg_t idx_pg;
+            result = get_osdmap()->object_locator_to_pg(idx_name, idx_oloc, idx_pg);
+            if (result < 0) {
+              dout(5) << " pool information is invalid: " << result << dendl;
+              break;
+            }
+            hobject_t idx_oid(idx_name, idx_oloc.key, snapid_t(),
+                idx_pg.ps(), idx_pg.pool(), idx_oloc.nspace);
+            need_inc_ref = inc_refcount_by_set(ctx, set_chunk, osd_op, idx_oid);
+          } else {
+            need_inc_ref = inc_refcount_by_set(ctx, set_chunk, osd_op);
+          }
 	  if (need_inc_ref) {
 	    result = -EINPROGRESS;
 	    break;

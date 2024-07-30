@@ -648,6 +648,22 @@ void librados::ObjectReadOperation::is_hot(bool *is_hot,
   o->is_hot(is_hot, deduped, archived, prval);
 }
 
+void librados::ObjectReadOperation::set_packed_chunk(uint64_t src_offset,
+              uint64_t src_length,
+              const IoCtx& tgt_ioctx,
+              string tgt_oid,
+              uint64_t tgt_offset,
+              const IoCtx& index_ioctx,
+              string index_oid,
+              int flag)
+{
+  ceph_assert(impl);
+  ::ObjectOperation *o = &impl->o;
+  o->set_packed_chunk(src_offset, src_length,
+      tgt_ioctx.io_ctx_impl->oloc, object_t(tgt_oid), tgt_offset,
+      index_ioctx.io_ctx_impl->oloc, object_t(index_oid), flag);
+}
+
 void librados::ObjectWriteOperation::set_redirect(const std::string& tgt_obj, 
 						  const IoCtx& tgt_ioctx,
 						  uint64_t tgt_version,

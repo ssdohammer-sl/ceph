@@ -53,6 +53,15 @@ string get_opts_chunk_pool(const po::variables_map &opts) {
   }
 }
 
+string get_opts_index_pool(const po::variables_map &opts) {
+  if (opts.count("index-pool")) {
+    return opts["index-pool"].as<string>();
+  } else {
+    cerr << "must specify --index-pool" << std::endl;
+    exit(1);
+  }
+}
+
 string get_opts_object_name(const po::variables_map &opts) {
   if (opts.count("object")) {
     return opts["object"].as<string>();
