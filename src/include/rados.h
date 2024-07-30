@@ -335,6 +335,7 @@ extern const char *ceph_osd_state_name(int s);
 	f(TIER_FLUSH, __CEPH_OSD_OP(CACHE, DATA, 43),	"tier-flush")	    \
 	f(TIER_EVICT, __CEPH_OSD_OP(CACHE, DATA, 44),	"tier-evict")	    \
   f(ISHOT, __CEPH_OSD_OP(RD, DATA, 45), "is-hot")  \
+  f(SET_PACKED_CHUNK, __CEPH_OSD_OP(CACHE, DATA, 46), "set-packed-chunk")  \
 									    \
 	/** attrs **/							    \
 	/* read */							    \

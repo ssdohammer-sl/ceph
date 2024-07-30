@@ -1655,6 +1655,21 @@ struct ObjectOperation {
     set_last_op_flags(flag);
   }
 
+  void set_packed_chunk(uint64_t src_offset, uint64_t src_length,
+                        object_locator_t tgt_oloc, object_t tgt_oid, uint64_t tgt_offset,
+                        object_locator_t idx_oloc, object_t idx_oid, int flag) {
+      using ceph::encode;
+      OSDOp& osd_op = add_op(CEPH_OSD_OP_SET_PACKED_CHUNK);
+      encode(src_offset, osd_op.indata);
+      encode(src_length, osd_op.indata);
+      encode(tgt_oloc, osd_op.indata);
+      encode(tgt_oid, osd_op.indata);
+      encode(tgt_offset, osd_op.indata);
+      encode(idx_oloc, osd_op.indata);
+      encode(idx_oid, osd_op.indata);
+      set_last_op_flags(flag);
+  }
+
   void tier_promote() {
     add_op(CEPH_OSD_OP_TIER_PROMOTE);
   }
