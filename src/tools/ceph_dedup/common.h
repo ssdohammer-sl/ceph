@@ -46,6 +46,8 @@
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_ceph_dedup
 
+#define CHUNK_LOC_ATTR "chunk_location"
+
 using namespace std;
 namespace po = boost::program_options;
 using namespace librados;

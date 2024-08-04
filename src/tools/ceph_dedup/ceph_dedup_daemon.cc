@@ -242,7 +242,7 @@ public:
     string poid = string(); // Accessed in the worker threads under po_lock
     std::shared_mutex po_lock;
     const string PO_PREFIX = "po_";
-    const string CHUNK_LOC_ATTR = "chunk_location";
+    //const string CHUNK_LOC_ATTR = "chunk_location";
 
   public:
     Packer() = delete;
@@ -303,7 +303,7 @@ public:
   private:
     pair<string, int> check_packed(IoCtx& index_io_ctx, string fp) {
       bufferlist bl;
-      int ret = index_io_ctx.getxattr(fp, CHUNK_LOC_ATTR.c_str(), bl);
+      int ret = index_io_ctx.getxattr(fp, CHUNK_LOC_ATTR, bl);
       if (ret == -ENOENT) {
   dout(5) << "fp: " << fp << " is not deduped" << dendl;
   return make_pair(string(), 0);
@@ -342,7 +342,7 @@ public:
       // do setxattr to update chunk location
       bufferlist loc;
       encode(make_pair(poid, chunk_offset), loc);
-      ret = index_io_ctx.setxattr(fp, CHUNK_LOC_ATTR.c_str(), loc);
+      ret = index_io_ctx.setxattr(fp, CHUNK_LOC_ATTR, loc);
       if (ret < 0) {
         derr << "setxattr chunk metadata object (" << fp << ") failed: "
           << cpp_strerror(ret) << dendl;
