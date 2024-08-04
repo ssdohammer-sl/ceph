@@ -103,7 +103,7 @@ po::options_description make_usage() {
      ": put chunk object's reference")
     ("op chunk-repair --chunk-pool <POOL> --object <OID> --target-ref <OID> --target-ref-pool-id <POOL_ID>",
      ": fix mismatched references")
-    ("op dump-chunk-refs --chunk-pool <POOL> --object <OID>",
+    ("op dump-chunk-refs --index-pool <POOL> --object <OID>",
      ": dump chunk object's references")
     ("op chunk-dedup --pool <POOL> --object <OID> --chunk-pool <POOL> --fingerprint-algorithm <FP> --source-off <OFFSET> --source-length <LENGTH>",
      ": perform a chunk dedup---deduplicate only a chunk, which is a part of object.")
@@ -120,6 +120,7 @@ po::options_description make_usage() {
     ("chunk-algorithm", po::value<std::string>(), ": <fixed|fastcdc>, set chunk-algorithm")
     ("fingerprint-algorithm", po::value<std::string>(), ": <sha1|sha256|sha512>, set fingerprint-algorithm")
     ("chunk-pool", po::value<std::string>(), ": set chunk pool name")
+    ("index-pool", po::value<std::string>(), ": set index pool name")
     ("max-thread", po::value<int>()->default_value(2), ": set max thread")
     ("report-period", po::value<int>()->default_value(10), ": set report-period")
     ("max-seconds", po::value<int>(), ": set max runtime")
@@ -680,9 +681,9 @@ static void print_chunk_scrub()
 int chunk_scrub_common(const po::variables_map &opts)
 {
   Rados rados;
-  IoCtx io_ctx, chunk_io_ctx;
+  IoCtx io_ctx, chunk_io_ctx, index_io_ctx;
   std::string object_name, target_object_name;
-  string chunk_pool_name, op_name;
+  string chunk_pool_name, index_pool_name, op_name;
   int ret;
   unsigned max_thread = get_opts_max_thread(opts);
   std::map<std::string, std::string>::const_iterator i;
@@ -695,6 +696,7 @@ int chunk_scrub_common(const po::variables_map &opts)
 
   op_name = get_opts_op_name(opts);
   chunk_pool_name = get_opts_chunk_pool(opts);
+  index_pool_name = get_opts_index_pool(opts);
   boost::optional<pg_t> pgid(opts.count("pgid"), pg_t());
 
   ret = rados.init_with_context(g_ceph_context);
@@ -712,6 +714,13 @@ int chunk_scrub_common(const po::variables_map &opts)
   if (ret < 0) {
     cerr << "error opening pool "
 	 << chunk_pool_name << ": "
+	 << cpp_strerror(ret) << std::endl;
+    goto out;
+  }
+  ret = rados.ioctx_create(index_pool_name.c_str(), index_io_ctx);
+  if (ret < 0) {
+    cerr << "error opening pool "
+	 << index_pool_name << ": "
 	 << cpp_strerror(ret) << std::endl;
     goto out;
   }
@@ -734,17 +743,24 @@ int chunk_scrub_common(const po::variables_map &opts)
       cerr << "must specify target-ref-pool-id" << std::endl;
       exit(1);
     }
+    ret = rados.ioctx_create2(pool_id, io_ctx);
+    if (ret < 0) {
+      cerr << "error opening pool "
+           << pool_id << ": "
+           << cpp_strerror(ret) << std::endl;
+      goto out;
+    }
 
     uint32_t hash;
-    ret = chunk_io_ctx.get_object_hash_position2(object_name, &hash);
+    ret = io_ctx.get_object_hash_position2(target_object_name, &hash);
     if (ret < 0) {
       return ret;
     }
     hobject_t oid(sobject_t(target_object_name, CEPH_NOSNAP), "", hash, pool_id, "");
 
     auto run_op = [] (ObjectWriteOperation& op, hobject_t& oid,
-      string& object_name, IoCtx& chunk_io_ctx) -> int {
-      int ret = chunk_io_ctx.operate(object_name, &op);
+      string& object_name, IoCtx& index_io_ctx) -> int {
+      int ret = index_io_ctx.operate(object_name, &op);
       if (ret < 0) {
 	cerr << " operate fail : " << cpp_strerror(ret) << std::endl;
       }
@@ -754,21 +770,15 @@ int chunk_scrub_common(const po::variables_map &opts)
     ObjectWriteOperation op;
     if (op_name == "chunk-get-ref") {
       cls_cas_chunk_get_ref(op, oid);
-      ret = run_op(op, oid, object_name, chunk_io_ctx);
+      ret = run_op(op, oid, object_name, index_io_ctx);
     } else if (op_name == "chunk-put-ref") {
       cls_cas_chunk_put_ref(op, oid);
-      ret = run_op(op, oid, object_name, chunk_io_ctx);
+      ret = run_op(op, oid, object_name, index_io_ctx);
     } else if (op_name == "chunk-repair") {
-      ret = rados.ioctx_create2(pool_id, io_ctx);
-      if (ret < 0) {
-	cerr << oid << " ref " << pool_id
-	     << ": referencing pool does not exist" << std::endl;
-	return ret;
-      }
       int chunk_ref = -1, base_ref = -1;
-      // read object on chunk pool to know how many reference the object has
+      // read object on index pool to know how many reference the object has
       bufferlist t;
-      ret = chunk_io_ctx.getxattr(object_name, CHUNK_REFCOUNT_ATTR, t);
+      ret = index_io_ctx.getxattr(object_name, CHUNK_REFCOUNT_ATTR, t);
       if (ret < 0) {
 	return ret;
       }
@@ -789,17 +799,30 @@ int chunk_scrub_common(const po::variables_map &opts)
       cout << object_name << " has " << chunk_ref << " references for "
 	   << target_object_name << std::endl;
 
+      // read the location of the pack object where the chunk is stored
+      bufferlist loc;
+      ret = index_io_ctx.getxattr(object_name, CHUNK_LOC_ATTR, loc);
+      if (ret < 0) {
+        return ret;
+      }
+      pair<string, uint32_t> chunk_loc;
+      auto pcl = loc.cbegin();
+      decode(chunk_loc, pcl);
+
+      cout << object_name << " has chunk_location of poid: " << chunk_loc.first
+        << ", offset: "  << chunk_loc.second << std::endl;
+
       // read object on base pool to know the number of chunk object's references
-      base_ref = cls_cas_references_chunk(io_ctx, target_object_name, object_name);
+      base_ref = cls_cas_references_chunk(io_ctx, target_object_name, chunk_loc.first);
       if (base_ref < 0) {
 	if (base_ref == -ENOENT || base_ref == -ENOLINK) {
 	  base_ref = 0;
 	} else {
 	  return base_ref;
-	}
+        }
       }
       cout << target_object_name << " has " << base_ref << " references for "
-	   << object_name << std::endl;
+	   << chunk_loc.first << std::endl;
       if (chunk_ref != base_ref) {
 	if (base_ref > chunk_ref) {
 	  cerr << "error : " << target_object_name << "'s ref. < " << object_name
@@ -812,7 +835,7 @@ int chunk_scrub_common(const po::variables_map &opts)
 	  ObjectWriteOperation op;
 	  cls_cas_chunk_put_ref(op, oid);
 	  chunk_ref--;
-	  ret = run_op(op, oid, object_name, chunk_io_ctx);
+	  ret = run_op(op, oid, object_name, index_io_ctx);
 	  if (ret < 0) {
 	    return ret;
 	  }
@@ -824,15 +847,31 @@ int chunk_scrub_common(const po::variables_map &opts)
   } else if (op_name == "dump-chunk-refs") {
     object_name = get_opts_object_name(opts);
     bufferlist t;
-    ret = chunk_io_ctx.getxattr(object_name, CHUNK_REFCOUNT_ATTR, t);
+    ret = index_io_ctx.getxattr(object_name, CHUNK_REFCOUNT_ATTR, t);
     if (ret < 0) {
       return ret;
     }
     chunk_refs_t refs;
     auto p = t.cbegin();
     decode(refs, p);
+
+    bufferlist loc;
+    ret = index_io_ctx.getxattr(object_name, CHUNK_LOC_ATTR, loc);
+    if (ret < 0) {
+      return ret;
+    }
+    pair<string, uint32_t> chunk_loc;
+    auto pcl = loc.cbegin();
+    decode(chunk_loc, pcl);
+
     auto f = Formatter::create("json-pretty");
+    f->open_object_section("chunk_metadata_object");
     f->dump_object("refs", refs);
+    f->open_object_section("chunk_loc");
+    f->dump_string("poid", chunk_loc.first);
+    f->dump_unsigned("offset", chunk_loc.second);
+    f->close_section();
+    f->close_section();
     f->flush(cout);
     return 0;
   }
