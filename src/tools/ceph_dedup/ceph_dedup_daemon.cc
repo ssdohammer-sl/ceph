@@ -31,6 +31,10 @@ po::options_description make_usage() {
     ("wakeup-period", po::value<int>(), ": set the wakeup period of crawler thread (sec)")
     ("fpstore-threshold", po::value<size_t>()->default_value(100_M), ": set max size of in-memory fingerprint store (bytes)")
     ("pack-obj-size", po::value<size_t>()->default_value(4_M), ": set pack object size (bytes)")
+    ("packer-type", po::value<std::string>(), ": type of object packer")
+    ("max-apo-entries", po::value<uint32_t>(), ": maximum number of ActivePackObject entries")
+    ("bit-vector-len", po::value<uint32_t>(), ": bit vector length of the bloom filter")
+    ("similarity-threshold", po::value<uint32_t>(), ": low threshold value of hamming similarity")
     ("run-once", ": do a single iteration for debug")
   ;
   desc.add(op_desc);
@@ -237,6 +241,7 @@ public:
   };
 
   class Packer {
+  protected:
     size_t max_po_size;
     size_t po_size = 0; // Accessed in the worker threads under po_lock
     string poid = string(); // Accessed in the worker threads under po_lock
@@ -252,8 +257,9 @@ public:
       max_po_size(max_po_size) {}
     //Packer(Packer&& packer) :
       //max_po_size(packer.max_po_size) {}
+    virtual ~Packer() {}
 
-    void pack_chunk(IoCtx& io_ctx, IoCtx& chunk_io_ctx, IoCtx& index_io_ctx,
+    virtual void pack_chunk(IoCtx& io_ctx, IoCtx& chunk_io_ctx, IoCtx& index_io_ctx,
         chunk_t chunk) {
       int ret;
       std::unique_lock pl(po_lock);
@@ -299,7 +305,7 @@ public:
       }
     }
 
-  private:
+  protected:
     pair<string, int> check_packed(IoCtx& index_io_ctx, string fp) {
       bufferlist bl;
       int ret = index_io_ctx.getxattr(fp, CHUNK_LOC_ATTR, bl);
@@ -347,6 +353,115 @@ public:
           << cpp_strerror(ret) << dendl;
       }
       return ret;
+    }
+  };
+
+  class HeuristicPacker: public Packer {
+  private:
+    //std::atomic<int> poid_idx = 0;
+    uint32_t max_apo_entries = 0;
+    uint32_t bv_len = 0;
+    uint32_t similarity_threshold = 0;
+    map<poid, pair<bloom_filter, uint64_t>> apo_map;
+    ceph::shared_mutex apo_lock = ceph::make_shared_mutex("apo lock");
+
+  public:
+    HeuristicPacker(uint64_t max_po_size, uint32_t max_apo_entries, uint32_t bv_len,
+                    uint32_t similarity_threshold)
+      : Packer(max_po_size), max_apo_entries(max_apo_entries), bv_len(bv_len),
+        similarity_threshold(similarity_threshold) {}
+    virtual ~HeuristicPacker() {}
+
+    HeuristicPacker() = delete;
+    HeuristicPacker(const HeuristicPacker&) = delete;
+    HeuristicPacker& operator=(const HeuristicPacker&) = delete;
+
+    virtual void pack_chunk(IoCtx& io_ctx, IoCtx& chunk_io_ctx, IoCtx& index_io_ctx,
+        chunk_t chunk) {
+      int ret;
+      poid = get_similar_poid(
+      std::unique_lock pl(po_lock);
+      // check pack object is available
+      if (poid.empty() || po_size >= max_po_size) {
+  poid = PO_PREFIX + chunk.fingerprint;
+  if (create_pack_object(chunk_io_ctx) < 0) {
+    return;
+  }
+  po_size = 0;
+      }
+
+      // check whether the chunk is deduped
+      // if chunk is deduped, return its location (poid and offset)
+      pair<string, int> chunk_loc = check_packed(index_io_ctx, chunk.fingerprint);
+      int chunk_offset = chunk_loc.second;
+      if (chunk_loc.first.empty()) {
+  chunk_offset = po_size;
+
+  // append chunk data to the pack object
+  ret = chunk_io_ctx.write(poid, chunk.data, chunk.size, chunk_offset);
+  if (ret < 0) {
+    derr << "append chunk data to " << poid << " failed: " << cpp_strerror(ret) << dendl;
+    return;
+  }
+  po_size += chunk.size;
+
+  if (create_chunk_metadata_object(index_io_ctx, chunk.fingerprint, chunk_offset) < 0) {
+    return;
+  }
+      }
+      
+      
+    }
+
+  private:
+    string get_similar_poid(bloom_filter& mo_bf, uint64_t chunk_size) {
+      string target_poid;
+      string min_size_poid;
+      uint32_t max_score = 0;
+      int min_po_size = INT_MAX;
+
+      unique_lock al(apo_lock);
+      if (active_pack_objs.empty()) {
+        target_poid = poid_idx;
+        al.unlock();
+        return target_poid;
+      }
+
+      // find the most similar pack object
+      for (auto& kv : active_pack_objs) {
+        if (kv.second.second <= 0) {
+          continue;
+        }
+        bloom_filter& po_bf = kv.second.first;
+        uint32_t score = get_hamming_similarity(mo_bf, po_bf);
+        int poid = kv.first;
+        if (score > max_score) {
+          max_score = score;
+          target_poid = poid;
+        }
+  
+        // update minimum pack object size just in case of similarity not found
+        int po_size = kv.second.second;
+        if (po_size < min_po_size) {
+          min_po_size = po_size;
+          min_size_poid = poid;
+        }
+      }
+    
+      // similarity not found
+      if (max_score < similarity_threshold) {
+        cout << "similarity not found" << std::endl;
+  
+        // APO entries full. append to smallest pack object
+        if (active_pack_objs.size() >= max_apo_entries) {
+          cout << "apo map full. " << min_size_poid << " is selected" << std::endl;
+          target_poid = min_size_poid;
+        } else {
+          target_poid = poid_idx;
+        }
+      }
+      al.unlock();
+      return target_poid;
     }
   };
 
@@ -796,6 +911,22 @@ int make_crawling_daemon(const po::variables_map &opts)
   size_t pack_object_size = 4 * 1024 * 1024;
   if (opts.count("pack-obj-size")) {
     pack_object_size = opts["pack-obj-size"].as<size_t>();
+  }
+  string packer_type = "simple";  // deafault packer type
+  if (opts.count("packer-type")) {
+    packer_type = opts["packer-type"].as<string>();
+  }
+  uint32_t max_apo_entries = 0; // default max apo entries
+  if (opts.count("max-apo-entries")) {
+    max_apo_entries = opts["max-apo-entries"].as<uint32_t>();
+  }
+  uint32_t bv_len = 32768;  // default bit vector length
+  if (opts.count("bit-vector-len")) {
+    bv_len = opts["bit-vector-len"].as<uint32_t>();
+  }
+  uint32_t similarity_threshold = 10; // default similarity threshold
+  if (opts.count("similarity-threshold")) {
+    similarity_threshold = opts["similarity-threshold"].as<uint32_t>();
   }
 
   std::string chunk_algo = get_opts_chunk_algo(opts);
