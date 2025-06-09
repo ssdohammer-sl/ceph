@@ -63,7 +63,7 @@
     "@popperjs/core": "2.10.2",
     "@swimlane/ngx-datatable": "18.0.0",
     "@types/file-saver": "2.0.1",
-    "async-mutex": "0.2.4",
+    "async-mutex": "0.5.0",
     "bootstrap": "5.2.3",
     "carbon-components-angular": "5.25.1",
     "chart.js": "4.4.0",
